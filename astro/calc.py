@@ -24,6 +24,10 @@ def geocode(place:str):
     if not tz: raise ValueError("Timezone not found")
     return float(loc.latitude), float(loc.longitude), tz
 
+def ecl_lon_from_skyfield(app):
+    ecl = app.ecliptic_latlon()
+    return float(ecl[1].degrees % 360.0)
+
 def to_utc(date:str, time_str:str|None, tz_str:str):
     if time_str is None: t=dtime(12,0); estimated=True
     else: hh,mm=map(int,time_str.split(':')); t=dtime(hh,mm); estimated=False
