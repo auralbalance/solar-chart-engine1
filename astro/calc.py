@@ -28,6 +28,7 @@ try:
 except Exception:
     HAS_HORIZONS = False
 
+
 # =========================
 # EPHEMERIS (cached)
 # =========================
@@ -60,6 +61,7 @@ def pick_key(eph, preferred: str, fallback: str) -> str:
             return fallback
         except Exception:
             raise KeyError(f"Neither '{preferred}' nor '{fallback}' available in ephemeris.")
+
 
 # =================
 # GEO / TIME  (TTL cache)
@@ -112,8 +114,9 @@ def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetim
     dt_loc = tz.localize(dt_local)
     return dt_loc.astimezone(utc), est
 
+
 # ==========================
-# SIGN LABELS (IAU → 13-sign)
+# SIGN CANON (IAU → 13 canonical), typo-proof
 # ==========================
 CONSTELLATION_TO_13 = {
     "Aries": "Aries",
@@ -136,19 +139,45 @@ SIGNS_13 = [
     "Capricornus","Aquarius","Pisces",
 ]
 
-def constellation_to_13sign(iau_name: str) -> str:
-    return CONSTELLATION_TO_13.get(iau_name, iau_name)
+# common incoming variants → canonical
+_ALIAS = {
+    "scorpio": "Scorpius",
+    "capricorn": "Capricornus",
+    "ophiucus": "Ophiuchus",   # missing 'h'
+    "ophiuchus": "Ophiuchus",
+    "ophiu chus": "Ophiuchus",
+    "ophiucus ": "Ophiuchus",
+}
+
+def canon_sign(name: str) -> str:
+    s = str(name).strip()
+    low = s.lower().replace("’","'").replace("`","'")
+    if low in _ALIAS:
+        return _ALIAS[low]
+    if low.startswith("ophiu"):
+        return "Ophiuchus"
+    if low.startswith("scorp"):
+        return "Scorpius"
+    if low.startswith("capricor"):
+        return "Capricornus"
+    # direct match ignoring case
+    for sign in SIGNS_13:
+        if low == sign.lower():
+            return sign
+    # last resort: title-case
+    return s[:1].upper() + s[1:].lower()
+
 
 # ==========================
 # TRUE-SKY CLASSIFIERS
 # ==========================
 def sign_from_icrs(ra_hours: float, dec_degrees: float) -> str:
     """
-    Classify an object by IAU constellation using its ICRS RA/Dec, then map to 13-sign label.
-    This is the most faithful approach to the real sky.
+    Classify by IAU constellation from ICRS RA/Dec, then canonicalize to 13-sign label.
     """
     sc_icrs = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_degrees * u.deg, frame=ICRS())
-    return constellation_to_13sign(get_constellation(sc_icrs))
+    iau = get_constellation(sc_icrs)
+    return canon_sign(CONSTELLATION_TO_13.get(iau, iau))
 
 def sign_from_ecl_lon(lon_deg: float) -> str:
     """
@@ -156,11 +185,13 @@ def sign_from_ecl_lon(lon_deg: float) -> str:
     """
     sc_ecl = SkyCoord(lon=lon_deg * u.deg, lat=0.0 * u.deg,
                       frame=GeocentricTrueEcliptic(equinox=Time("J2000")))
-    return constellation_to_13sign(get_constellation(sc_ecl.icrs))
+    iau = get_constellation(sc_ecl.icrs)
+    return canon_sign(CONSTELLATION_TO_13.get(iau, iau))
+
 
 def ecl_lon_from_app(app) -> float:
     """
-    Skyfield apparent RA/Dec → ICRS → ecliptic J2000 → λ (deg 0..360) for drawing wheels.
+    Skyfield apparent RA/Dec → ICRS → ecliptic J2000 → λ (deg 0..360) for wheels.
     """
     ra, dec, _ = app.radec()
     sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle,
@@ -169,11 +200,13 @@ def ecl_lon_from_app(app) -> float:
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
+
 def mean_lunar_node_lon(dt_utc: datetime) -> float:
     t = Time(dt_utc).jd
     T = (t - 2451545.0) / 36525.0
     Omega = 125.04452 - 1934.136261 * T + 0.0020708 * T * T + (T ** 3) / 450000.0
     return Omega % 360.0
+
 
 def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
     """
@@ -185,9 +218,10 @@ def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
+
 def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional[float]:
     """
-    Chiron ecliptic longitude via JPL Horizons. Topocentric if possible, else geocentric.
+    Chiron ecliptic longitude via JPL Horizons (topocentric if possible; else geocentric).
     """
     if not HAS_HORIZONS:
         return None
@@ -206,6 +240,7 @@ def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional
     sc_icrs = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=ICRS())
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
+
 
 # ==================
 # ASCENDANT SOLVER
@@ -248,20 +283,39 @@ def compute_ascendant(ts, observer) -> float:
         L0 = best[1]; step *= 0.5
     return L0 % 360.0
 
+
 # ===============
 # 13-HOUSE MODEL
 # ===============
 def build_houses_13(asc_sign: str) -> List[Dict[str, Any]]:
+    asc_sign = canon_sign(asc_sign)
     start_idx = SIGNS_13.index(asc_sign)
     return [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(13)]
 
 def house_number_for_sign_13(sign: str, asc_sign: str) -> int:
+    """
+    Return 1..13. Robust to common typos/variants.
+    """
+    sign = canon_sign(sign)
+    asc_sign = canon_sign(asc_sign)
+    if sign not in SIGNS_13:
+        # never 500—fallback heuristics keep charts rendering
+        if sign.lower().startswith("ophiu"):
+            sign = "Ophiuchus"
+        elif sign.lower().startswith("scorp"):
+            sign = "Scorpius"
+        elif sign.lower().startswith("capricor"):
+            sign = "Capricornus"
+        else:
+            # if still unknown, treat as Pisces for indexing (rare)
+            sign = "Pisces"
     asc_i = SIGNS_13.index(asc_sign)
     sign_i = SIGNS_13.index(sign)
     return ((sign_i - asc_i) % 13) + 1
 
+
 # ===============
-# MAIN CHART
+# MAIN CHART (true sky; 13 houses only)
 # ===============
 def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> Tuple[Dict[str, Any], bool]:
     # 1) Geo + time
@@ -279,7 +333,7 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
     asc_sign = sign_from_ecl_lon(asc_lon)
     ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign, "house": 1}
 
-    # 4) Planets (true-sky sign via IAU constellation from ICRS; λ kept for drawing)
+    # 4) Planets (true sky sign via IAU; λ for wheels)
     targets = {
         "Sun":      pick_key(eph, "sun", "10"),
         "Moon":     pick_key(eph, "moon", "301"),
