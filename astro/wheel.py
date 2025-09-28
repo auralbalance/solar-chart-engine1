@@ -30,3 +30,10 @@ def make_svg_wheel(data:dict, outfile:str, R:int=200):
     asc=data.get("ascendant",{}).get("lon",0)%360; ax=cx+(R-6)*math.cos(math.radians(asc-90)); ay=cy+(R-6)*math.sin(math.radians(asc-90))
     g.add(dwg.line(start=(cx,cy), end=(ax,ay), stroke="#d33", stroke_width=2)); g.add(dwg.text("ASC", insert=(ax,ay-10), text_anchor="middle", font_size="10px", fill="#d33"))
     dwg.add(g); dwg.save(); return outfile
+         # After ASC:
+for tag, lon in [('MC', data.get('midheaven',{}).get('lon')),
+                 ('NN', data.get('nodes',{}).get('north_node',{}).get('lon')),
+                 ('SN', data.get('nodes',{}).get('south_node',{}).get('lon'))]:
+    if lon is None: continue
+    ax = cx+(R-6)*math.cos(math.radians(lon-90)); ay = cy+(R-6)*math.sin(math.radians(lon-90))
+    g.add(dwg.text(tag, insert=(ax, ay-10), text_anchor="middle", font_size="10px", fill="#2ad"))
