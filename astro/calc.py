@@ -32,6 +32,34 @@ def ecl_lon_from_skyfield(apparent):
     lat, lon, dist = apparent.ecliptic_latlon()
     return float(lon.degrees % 360.0)
 
+def mean_lunar_node_lon(dt_utc):
+    # Meeus approximation, sufficient for chart labeling (mean node)
+    # T in Julian centuries since J2000.0
+    t = Time(dt_utc).jd
+    T = (t - 2451545.0) / 36525.0
+    # Longitude of ascending node of the Moon's mean orbit (Ω), degrees
+    # Meeus (1998) ch. 22 truncated:
+    Omega = 125.04452 - 1934.136261*T + 0.0020708*T*T + (T*T*T)/450000.0
+    return Omega % 360.0
+
+def south_node_lon(north_node_lon):
+    return (north_node_lon + 180.0) % 360.0
+
+def midheaven_lon(dt_utc, lon_deg):
+    # MC longitude: ecliptic longitude where ecliptic intersects local MERIDIAN (upper culmination).
+    # Use local apparent sidereal time and obliquity.
+    obstime = Time(dt_utc)
+    eps = 23.43929111  # mean obliquity deg (OK for labeling)
+    # Local sidereal angle in degrees:
+    lst = obstime.sidereal_time('apparent', longitude=lon_deg*u.deg).deg  # 0..360
+    # MC ecliptic longitude formula:
+    # tan(Lmc) = tan(LST) / cos(eps)
+    import math
+    LST = math.radians(lst)
+    ce = math.cos(math.radians(eps))
+    Lmc = math.degrees(math.atan2(math.tan(LST), ce)) % 360.0
+    return Lmc
+
 def ascendant_lon_accurate(dt_utc, lat, lon):
     # Alt=0°, Az=90° (due East) transformed to ecliptic longitude
     obstime = Time(dt_utc)
@@ -45,6 +73,17 @@ def compute_chart(name:str, date:str, time_str:str|None, place:str):
     dt_utc, est = to_utc(date, time_str, tz)
     eph=_eph(); ts=LOADER.timescale().from_datetime(dt_utc)
     obs = eph['earth'] + Topos(latitude_degrees=lat, longitude_degrees=lon)
+    # Nodes
+    nn_lon = mean_lunar_node_lon(dt_utc)
+    sn_lon = south_node_lon(nn_lon)
+    nodes = {
+        'north_node': {'lon': nn_lon, 'sign': sign_from_ecliptic_lon(nn_lon)},
+        'south_node': {'lon': sn_lon, 'sign': sign_from_ecliptic_lon(sn_lon)}
+    }
+
+    # Midheaven (MC)
+    mc_lon = midheaven_lon(dt_utc, lon)
+    mc = {'lon': mc_lon, 'sign': sign_from_ecliptic_lon(mc_lon)}
 
     bodies = {
         'Sun': eph['sun'],
@@ -86,6 +125,8 @@ def compute_chart(name:str, date:str, time_str:str|None, place:str):
         'datetime_utc': dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'location': {'lat': lat, 'lon': lon, 'tz': tz},
         'ascendant': ascendant,
+        'midheaven': mc,
+        'nodes': nodes,
         'planets': planets,
         'houses': houses
     }, est
