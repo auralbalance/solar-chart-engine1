@@ -4,7 +4,7 @@ skyfield==1.46
 numpy==1.26.4
 astropy==6.0.0
 geopy==2.4.1
-timezonefinder==6.2.0
+timezonefinder==5.2.0
 pytz==2024.1
 svgwrite==1.4.3
 python-multipart==0.0.9
