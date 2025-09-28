@@ -1,6 +1,8 @@
 from skyfield.api import Loader, Topos
 from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
+from astroquery.jplhorizons import Horizons
+from astropy.time import Time
 from datetime import datetime, time as dtime
 from pytz import timezone, utc
 import numpy as np
@@ -68,11 +70,55 @@ def ascendant_lon_accurate(dt_utc, lat, lon):
     ecl = east_horizon.transform_to(GeocentricTrueEcliptic(equinox=obstime))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
+def chiron_ecl_lon(dt_utc, lat_deg, lon_deg):
+    """
+    Fetch Chiron topocentric apparent RA/Dec from JPL Horizons and return ecliptic longitude (deg).
+    Uses observer location (lon,lat, elev=0).
+    """
+    # Horizons expects "lon,lat,elv" in *degrees* and meters
+    loc_str = f"{lon_deg},{lat_deg},0"
+    t = Time(dt_utc)
+    try:
+        obj = Horizons(id='2060', id_type='smallbody', location=loc_str, epochs=t.jd)
+        eph = obj.ephemerides()
+        ra = float(eph['RA'][0])   # degrees
+        dec = float(eph['DEC'][0]) # degrees
+        sc = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+        ecl = sc.transform_to(GeocentricTrueEcliptic(equinox=t))
+        return float(ecl.lon.to(u.deg).value % 360.0)
+    except Exception as e:
+        # Fallback to geocentric if topocentric query fails
+        obj = Horizons(id='2060', id_type='smallbody', location='geo', epochs=t.jd)
+        eph = obj.ephemerides()
+        ra = float(eph['RA'][0])
+        dec = float(eph['DEC'][0])
+        sc = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+        ecl = sc.transform_to(GeocentricTrueEcliptic(equinox=t))
+        return float(ecl.lon.to(u.deg).value % 360.0)
+
 def compute_chart(name:str, date:str, time_str:str|None, place:str):
     lat, lon, tz = geocode(place)
     dt_utc, est = to_utc(date, time_str, tz)
     eph=_eph(); ts=LOADER.timescale().from_datetime(dt_utc)
     obs = eph['earth'] + Topos(latitude_degrees=lat, longitude_degrees=lon)
+        # ... planets loop above ...
+
+    # --- Chiron ---
+    chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
+    planets.append({
+        'body': 'Chiron',
+        'lon': chi_lon,
+        'sign': sign_from_ecliptic_lon(chi_lon),
+        'constellation': constellation_to_13sign(
+            get_constellation(
+                SkyCoord(
+                    lon=chi_lon*u.deg, lat=0*u.deg,
+                    frame=GeocentricTrueEcliptic(equinox=Time(dt_utc))
+                ).transform_to('icrs')
+            )
+        )
+    })
+
     # Nodes
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = south_node_lon(nn_lon)
