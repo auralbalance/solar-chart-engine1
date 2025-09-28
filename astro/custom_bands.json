@@ -1,0 +1,15 @@
+[
+  {"name":"Aries",       "start":   0.0, "end":  30.0},
+  {"name":"Taurus",      "start":  30.0, "end":  72.0},
+  {"name":"Gemini",      "start":  72.0, "end":  90.0},
+  {"name":"Cancer",      "start":  90.0, "end": 138.0},
+  {"name":"Leo",         "start": 138.0, "end": 168.0},
+  {"name":"Virgo",       "start": 168.0, "end": 204.0},
+  {"name":"Libra",       "start": 204.0, "end": 241.0},
+  {"name":"Scorpius",    "start": 241.0, "end": 247.0},
+  {"name":"Ophiuchus",   "start": 247.0, "end": 266.0},
+  {"name":"Sagittarius", "start": 266.0, "end": 296.0},
+  {"name":"Capricornus", "start": 296.0, "end": 326.0},
+  {"name":"Aquarius",    "start": 326.0, "end": 353.0},
+  {"name":"Pisces",      "start": 353.0, "end": 360.0}
+]
