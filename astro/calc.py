@@ -100,30 +100,68 @@ def chiron_ecl_lon(dt_utc, lat_deg, lon_deg):
         ecl = sc.transform_to(GeocentricTrueEcliptic(equinox=t))
         return float(ecl.lon.to(u.deg).value % 360.0)
 
-def compute_chart(name:str, date:str, time_str:str|None, place:str):
-    lat, lon, tz = geocode(place)
-    dt_utc, est = to_utc(date, time_str, tz)
-    eph=_eph(); ts=LOADER.timescale().from_datetime(dt_utc)
-    obs = eph['earth'] + Topos(latitude_degrees=lat, longitude_degrees=lon)
-        # ... planets loop above ...
+def compute_chart(name, date, time_str, place):
+    # --- 1) Geocode + timezone + UTC ---
+    lat, lon, tz_str = geocode_place(place)
+    dt_utc, est = to_utc(date, time_str, tz_str)
 
-    # --- Chiron ---
-    chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
-    planets.append({
-        'body': 'Chiron',
-        'lon': chi_lon,
-        'sign': sign_from_ecliptic_lon(chi_lon),
-        'constellation': constellation_to_13sign(
-            get_constellation(
-                SkyCoord(
-                    lon=chi_lon*u.deg, lat=0*u.deg,
-                    frame=GeocentricTrueEcliptic(equinox=Time(dt_utc))
-                ).transform_to('icrs')
-            )
-        )
-    })
+    # --- 2) Skyfield setup (cache ephemeris) ---
+    eph = get_ephemeris()  # make sure get_ephemeris() loads de421.bsp from skyfield_data
+    ts  = _LOADER.timescale().from_datetime(dt_utc)
 
-    # Nodes
+    # Observer
+    observer = eph['earth'] + Topos(latitude_degrees=lat, longitude_degrees=lon)
+
+    # Bodies to calculate
+    bodies = {
+        'Sun'    : eph['sun'],
+        'Moon'   : eph['moon'],
+        'Mercury': eph['mercury'],
+        'Venus'  : eph['venus'],
+        'Mars'   : eph['mars'],
+        'Jupiter': eph['jupiter'],
+        'Saturn' : eph['saturn'],
+        'Uranus' : eph['uranus'],
+        'Neptune': eph['neptune'],
+        'Pluto'  : eph['pluto'],
+    }
+
+    # --- 3) Ascendant (ecliptic lon) ---
+    asc_lon = compute_ascendant(ts, observer, ts.tt, lat, lon)
+    # For display: keep IAU constellation name from equatorial, but label sign by ecliptic lon
+    asc_const = "—"
+    try:
+        # rough equatorial constellation for info
+        app0 = observer.at(ts).observe(eph['sun']).apparent()
+        ra, dec, _ = app0.radec()
+        sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
+        asc_const = get_constellation(sc)  # not the real asc constellation; purely decorative
+    except Exception:
+        pass
+    asc_sign = sign_from_ecliptic_lon(asc_lon)
+    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': constellation_to_13sign(asc_const)}
+
+    # --- 4) Planets ---
+    planets = []  # <<<<<< CRUCIAL: initialize the list
+
+    for body_name, target in bodies.items():
+        app = observer.at(ts).observe(target).apparent()
+        lon_ecl = ecl_lon_from_skyfield(app)  # returns degrees 0..360
+        # constellation (equatorial polygons, mapped to zodiac naming)
+        try:
+            ra, dec, _ = app.radec()
+            sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
+            const_raw = get_constellation(sc)
+        except Exception:
+            const_raw = ""
+        planets.append({
+            'body': body_name,
+            'lon': lon_ecl,
+            'sign': sign_from_ecliptic_lon(lon_ecl),
+            'constellation': constellation_to_13sign(const_raw)
+        })
+
+    # --- 5) Nodes (mean) ---
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = south_node_lon(nn_lon)
     nodes = {
@@ -131,52 +169,34 @@ def compute_chart(name:str, date:str, time_str:str|None, place:str):
         'south_node': {'lon': sn_lon, 'sign': sign_from_ecliptic_lon(sn_lon)}
     }
 
-    # Midheaven (MC)
+    # --- 6) Midheaven ---
     mc_lon = midheaven_lon(dt_utc, lon)
     mc = {'lon': mc_lon, 'sign': sign_from_ecliptic_lon(mc_lon)}
 
-    bodies = {
-        'Sun': eph['sun'],
-        'Moon': eph['moon'],
-        'Mercury': eph['mercury'],
-        'Venus': eph['venus'],
-        'Mars': eph['mars'],
-        'Jupiter': eph['jupiter barycenter'],
-        'Saturn': eph['saturn barycenter'],
-        'Uranus': eph['uranus barycenter'],
-        'Neptune': eph['neptune barycenter'],
-        'Pluto': eph['pluto barycenter']
-    }
+    # --- 7) Chiron (via astroquery Horizons) ---
+    try:
+        chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
+        planets.append({
+            'body': 'Chiron',
+            'lon': chi_lon,
+            'sign': sign_from_ecliptic_lon(chi_lon),
+            'constellation': '—'  # optional: compute like others if you want
+        })
+    except Exception:
+        # if Horizons is down, keep going without Chiron
+        pass
 
-    planets=[]
-    for name_b, target in bodies.items():
-        app = obs.at(ts).observe(target).apparent()
-        lon_ecl = ecl_lon_from_skyfield(app)
-        ra, dec, _ = app.radec()
-        sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
-        const = get_constellation(sc)
-        # Map Serpens -> Ophiuchus then ALSO compute sign from ecliptic longitude
-        const_mapped = constellation_to_13sign(const)
-        sign = sign_from_ecliptic_lon(lon_ecl)
-        planets.append({'body': name_b, 'lon': lon_ecl, 'sign': sign, 'constellation': const_mapped})
+    # --- 8) Houses: whole-sign from ASC sign (12 houses) ---
+    houses = [{'house': i+1, 'sign': s} for i, s in enumerate(cycle_from(asc_sign, 12))]
 
-    asc_lon = ascendant_lon_accurate(dt_utc, lat, lon)
-    ecl_sc = SkyCoord(lon=asc_lon*u.deg, lat=0*u.deg, frame=GeocentricTrueEcliptic(equinox=Time(dt_utc)))
-    icrs_sc = ecl_sc.transform_to('icrs')
-    asc_const = get_constellation(icrs_sc)
-    asc_sign = sign_from_ecliptic_lon(asc_lon)
-    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': constellation_to_13sign(asc_const)}
-
-
-    houses = [{'house': i+1, 'sign': cycle_from(asc_sign,12)[i]} for i in range(12)]
-
+    # --- 9) Payload ---
     return {
         'name': name,
         'datetime_utc': dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'location': {'lat': lat, 'lon': lon, 'tz': tz},
+        'location': {'lat': lat, 'lon': lon, 'tz': tz_str},
         'ascendant': ascendant,
         'midheaven': mc,
         'nodes': nodes,
-        'planets': planets,
+        'planets': planets,            # <<<<<< uses the initialized list
         'houses': houses
     }, est
