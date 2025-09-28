@@ -194,7 +194,7 @@ def compute_chart(name: str, date: str, time_str: str | None, place: str) -> Tup
         'Saturn': 'saturn barycenter',
         'Uranus': 'uranus barycenter',
         'Neptune': 'neptune barycenter',
-        'Pluto': 'pluto'
+        'Pluto': 'pluto barycenter'
     }
 
     planets = []
