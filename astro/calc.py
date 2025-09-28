@@ -1,5 +1,4 @@
 # astro/calc.py
-
 from __future__ import annotations
 import os, json
 from datetime import datetime, time as dtime
@@ -107,7 +106,7 @@ CONSTELLATION_TO_13 = {
     "Leo": "Leo",
     "Virgo": "Virgo",
     "Libra": "Libra",
-    "Scorpius": "Scorpius",
+    "Scorpius": "Scorpius",  # label 'Scorpius' to align with constellation naming
     "Ophiuchus": "Ophiuchus",
     "Sagittarius": "Sagittarius",
     "Capricornus": "Capricornus",
@@ -123,10 +122,27 @@ SIGNS_13 = [
 def constellation_to_13sign(iau_name: str) -> str:
     return CONSTELLATION_TO_13.get(iau_name, iau_name)
 
+# Built-in CUSTOM_13 tuned to your MTZ screenshot
+DEFAULT_CUSTOM_BANDS: List[Tuple[float, float, str]] = [
+    # name, start, end  (deg, J2000 ecliptic)
+    (0.0,   30.0,  "Aries"),
+    (30.0,  72.0,  "Taurus"),
+    (72.0,  90.0,  "Gemini"),
+    (90.0,  138.0, "Cancer"),
+    (138.0, 168.0, "Leo"),
+    (168.0, 204.0, "Virgo"),
+    (204.0, 241.0, "Libra"),
+    (241.0, 252.0, "Scorpius"),   # extends to 252 so Mercury ~250° is Scorpius
+    (252.0, 266.0, "Ophiuchus"),
+    (266.0, 296.0, "Sagittarius"),
+    (296.0, 326.0, "Capricornus"),
+    (326.0, 353.0, "Aquarius"),
+    (353.0, 360.0, "Pisces"),
+]
+
 # In-memory band store
 _ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # [(start_lon, end_lon, label13)]
 _BUILT_FOR_PROFILE: Optional[str] = None
-_BANDS_VERSION = 1  # bump to force rebuild
 
 
 def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
@@ -166,17 +182,18 @@ def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
         bands = [(last_s - 360.0, first_e, lab)] + bands[1:-1]
 
     bands.sort(key=lambda x: x[0])
-    return bands
+    # Convert to (start, end, name) like DEFAULT_CUSTOM_BANDS
+    return [(s, e, name) for (s, e, name) in bands]
 
 
 def _load_custom_bands() -> List[Tuple[float, float, str]]:
     """
     Load custom bands from env CUSTOM_BANDS (JSON string) or file astro/custom_bands.json.
+    If none provided, fall back to DEFAULT_CUSTOM_BANDS.
     Format:
     [
       {"name":"Aries","start":0.0,"end":24.0},
       ...
-      {"name":"Pisces","start":353.0,"end":360.0}
     ]
     """
     raw = os.getenv("CUSTOM_BANDS")
@@ -189,14 +206,14 @@ def _load_custom_bands() -> List[Tuple[float, float, str]]:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
     if not data:
-        raise RuntimeError("CUSTOM_13 profile selected but no custom bands provided.")
+        # Fall back to built-in defaults tuned to your MTZ screenshot
+        return DEFAULT_CUSTOM_BANDS
     bands: List[Tuple[float, float, str]] = []
     for item in data:
         name = item["name"]
         s = float(item["start"])
         e = float(item["end"])
         bands.append((s, e, name))
-    # sort and return
     bands.sort(key=lambda x: x[0])
     return bands
 
@@ -224,7 +241,6 @@ def sign_from_ecliptic_lon(lon_deg: float, profile: str) -> str:
             # wrap band e.g., start=350, end=10
             if x >= s or x < e:
                 return lab
-    # fallback
     return "Pisces"
 
 
@@ -313,26 +329,34 @@ def compute_ascendant(ts, observer) -> float:
             alt, az = alt_az_of_ecl_lon_j2000(L % 360.0)
             if 0.0 < az < 180.0:
                 a = abs(alt)
-                if a < best[0]):
+                if a < best[0]:
                     best = (a, L % 360.0)
         L0 = best[1]; step *= 0.5
     return L0 % 360.0
 
 
 # ===============
-# HOUSES (TOGGLE)
+# HOUSES (13 default)
 # ===============
 def build_houses(asc_sign: str, mode: str) -> List[Dict[str, Any]]:
     """
     Whole-sign logic, aligned to 13-sign belt.
     mode="12": 12 houses on 13-sign belt (ASC sign = House 1, then next 11 signs)
-    mode="13": 13 houses on 13-sign belt (ASC sign = House 1, then full cycle)
+    mode="13": 13 houses on 13-sign belt (ASC sign = House 1, full cycle)
     """
     if mode not in ("12", "13"):
-        mode = "12"
+        mode = "13"
     start_idx = SIGNS_13.index(asc_sign)
     count = 13 if mode == "13" else 12
     return [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(count)]
+
+
+def house_number_for_sign(sign: str, asc_sign: str, mode: str) -> int:
+    asc_i = SIGNS_13.index(asc_sign)
+    sign_i = SIGNS_13.index(sign)
+    delta = (sign_i - asc_i) % 13
+    count = 13 if mode == "13" else 12
+    return (delta % count) + 1
 
 
 # ===============
@@ -347,15 +371,15 @@ def compute_chart(
     zodiac_profile: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """
-    house_mode: "12" or "13". If None, env HOUSE_MODE; default "12".
-    zodiac_profile: "IAU_13" or "CUSTOM_13". If None, env ZODIAC_PROFILE; default "IAU_13".
+    house_mode: "12" or "13". If None, env HOUSE_MODE; default "13".
+    zodiac_profile: "IAU_13" or "CUSTOM_13". If None, env ZODIAC_PROFILE; default "CUSTOM_13".
     """
-    mode = (house_mode or os.getenv("HOUSE_MODE") or "12").strip().lower()
+    mode = (house_mode or os.getenv("HOUSE_MODE") or "13").strip().lower()
     mode = "13" if mode in ("13", "h13", "thirteen") else "12"
 
-    profile = (zodiac_profile or os.getenv("ZODIAC_PROFILE") or "IAU_13").strip().upper()
+    profile = (zodiac_profile or os.getenv("ZODIAC_PROFILE") or "CUSTOM_13").strip().upper()
     if profile not in ("IAU_13", "CUSTOM_13"):
-        profile = "IAU_13"
+        profile = "CUSTOM_13"
 
     # 1) Geo + time
     lat, lon, tz_str = geocode_place(place)
@@ -384,41 +408,58 @@ def compute_chart(
     # 4) Ascendant
     asc_lon = compute_ascendant(ts, observer)
     asc_sign = sign_from_ecliptic_lon(asc_lon, profile)
-    ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign}
+    ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign, "house": 1}
 
-    # 5) Planets → ecliptic J2000
+    # 5) Planets → ecliptic J2000 + houses
     planets: List[Dict[str, Any]] = []
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
         sign13 = sign_from_ecliptic_lon(L, profile)
-        planets.append({"body": label, "lon": L, "sign": sign13, "constellation": sign13})
+        planets.append({
+            "body": label,
+            "lon": L,
+            "sign": sign13,
+            "constellation": sign13,
+            "house": house_number_for_sign(sign13, asc_sign, mode),
+        })
 
     # 6) Nodes (mean)
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
     nodes = {
-        "north_node": {"lon": nn_lon, "sign": sign_from_ecliptic_lon(nn_lon, profile)},
-        "south_node": {"lon": sn_lon, "sign": sign_from_ecliptic_lon(sn_lon, profile)},
+        "north_node": {
+            "lon": nn_lon,
+            "sign": sign_from_ecliptic_lon(nn_lon, profile),
+            "house": house_number_for_sign(sign_from_ecliptic_lon(nn_lon, profile), asc_sign, mode),
+        },
+        "south_node": {
+            "lon": sn_lon,
+            "sign": sign_from_ecliptic_lon(sn_lon, profile),
+            "house": house_number_for_sign(sign_from_ecliptic_lon(sn_lon, profile), asc_sign, mode),
+        },
     }
 
     # 7) Midheaven
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc = {"lon": mc_lon, "sign": sign_from_ecliptic_lon(mc_lon, profile)}
+    mc_sign = sign_from_ecliptic_lon(mc_lon, profile)
+    mc = {"lon": mc_lon, "sign": mc_sign, "house": house_number_for_sign(mc_sign, asc_sign, mode)}
 
     # 8) Chiron (optional)
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
+        chi_sign = sign_from_ecliptic_lon(chi_lon, profile)
         planets.append(
             {
                 "body": "Chiron",
                 "lon": chi_lon,
-                "sign": sign_from_ecliptic_lon(chi_lon, profile),
-                "constellation": sign_from_ecliptic_lon(chi_lon, profile),
+                "sign": chi_sign,
+                "constellation": chi_sign,
+                "house": house_number_for_sign(chi_sign, asc_sign, mode),
             }
         )
 
-    # 9) Houses (toggle)
+    # 9) Houses (13 default)
     houses = build_houses(asc_sign, mode)
 
     payload = {
