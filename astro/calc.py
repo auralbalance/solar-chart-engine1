@@ -106,7 +106,7 @@ CONSTELLATION_TO_13 = {
     "Leo": "Leo",
     "Virgo": "Virgo",
     "Libra": "Libra",
-    "Scorpius": "Scorpius",  # label 'Scorpius' to align with constellation naming
+    "Scorpius": "Scorpius",
     "Ophiuchus": "Ophiuchus",
     "Sagittarius": "Sagittarius",
     "Capricornus": "Capricornus",
@@ -123,8 +123,10 @@ def constellation_to_13sign(iau_name: str) -> str:
     return CONSTELLATION_TO_13.get(iau_name, iau_name)
 
 # Built-in CUSTOM_13 tuned to your MTZ screenshot
+# Key differences vs IAU:
+# - Scorpius ends at 252° so Mercury 250.27° is Scorpius
+# - Sagittarius ends at 306° so North Node 301.47° is Sagittarius
 DEFAULT_CUSTOM_BANDS: List[Tuple[float, float, str]] = [
-    # name, start, end  (deg, J2000 ecliptic)
     (0.0,   30.0,  "Aries"),
     (30.0,  72.0,  "Taurus"),
     (72.0,  90.0,  "Gemini"),
@@ -132,23 +134,22 @@ DEFAULT_CUSTOM_BANDS: List[Tuple[float, float, str]] = [
     (138.0, 168.0, "Leo"),
     (168.0, 204.0, "Virgo"),
     (204.0, 241.0, "Libra"),
-    (241.0, 252.0, "Scorpius"),   # extends to 252 so Mercury ~250° is Scorpius
+    (241.0, 252.0, "Scorpius"),
     (252.0, 266.0, "Ophiuchus"),
-    (266.0, 296.0, "Sagittarius"),
-    (296.0, 326.0, "Capricornus"),
+    (266.0, 306.0, "Sagittarius"),
+    (306.0, 326.0, "Capricornus"),
     (326.0, 353.0, "Aquarius"),
     (353.0, 360.0, "Pisces"),
 ]
 
 # In-memory band store
-_ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # [(start_lon, end_lon, label13)]
+_ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # (start, end, name)
 _BUILT_FOR_PROFILE: Optional[str] = None
 
 
 def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
     """
     Build bands by sampling β=0° around the ecliptic at J2000 and detecting constellation changes.
-    Output bands cover [0,360). Frame: ecliptic J2000.
     """
     bands: List[Tuple[float, float, str]] = []
     t = Time("J2000")
@@ -158,11 +159,8 @@ def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
     n = int(360.0 / step_deg)
     for i in range(n + 1):
         L = (i * step_deg) % 360.0
-        sc = SkyCoord(
-            lon=L * u.deg,
-            lat=0.0 * u.deg,
-            frame=GeocentricTrueEcliptic(equinox=t),
-        ).icrs
+        sc = SkyCoord(lon=L * u.deg, lat=0.0 * u.deg,
+                      frame=GeocentricTrueEcliptic(equinox=t)).icrs
         label = constellation_to_13sign(get_constellation(sc))
         if current_label is None:
             current_label = label
@@ -175,45 +173,29 @@ def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
     if current_label is not None:
         bands.append((seg_start, 360.0, current_label))
 
-    # Merge wrap if needed
     if bands and bands[0][2] == bands[-1][2]:
         first_s, first_e, lab = bands[0]
         last_s, last_e, _ = bands[-1]
         bands = [(last_s - 360.0, first_e, lab)] + bands[1:-1]
 
     bands.sort(key=lambda x: x[0])
-    # Convert to (start, end, name) like DEFAULT_CUSTOM_BANDS
     return [(s, e, name) for (s, e, name) in bands]
 
 
 def _load_custom_bands() -> List[Tuple[float, float, str]]:
     """
-    Load custom bands from env CUSTOM_BANDS (JSON string) or file astro/custom_bands.json.
-    If none provided, fall back to DEFAULT_CUSTOM_BANDS.
+    Load custom bands from env CUSTOM_BANDS (JSON string).
+    We intentionally ignore any file to avoid stale overrides.
     Format:
-    [
-      {"name":"Aries","start":0.0,"end":24.0},
-      ...
-    ]
+      [{"name":"Aries","start":0.0,"end":30.0}, ...]
     """
     raw = os.getenv("CUSTOM_BANDS")
-    data = None
-    if raw:
-        data = json.loads(raw)
-    else:
-        path = os.path.join(os.path.dirname(__file__), "custom_bands.json")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-    if not data:
-        # Fall back to built-in defaults tuned to your MTZ screenshot
+    if not raw:
         return DEFAULT_CUSTOM_BANDS
+    data = json.loads(raw)
     bands: List[Tuple[float, float, str]] = []
     for item in data:
-        name = item["name"]
-        s = float(item["start"])
-        e = float(item["end"])
-        bands.append((s, e, name))
+        bands.append((float(item["start"]), float(item["end"]), str(item["name"])))
     bands.sort(key=lambda x: x[0])
     return bands
 
@@ -238,7 +220,6 @@ def sign_from_ecliptic_lon(lon_deg: float, profile: str) -> str:
             if s <= x < e:
                 return lab
         else:
-            # wrap band e.g., start=350, end=10
             if x >= s or x < e:
                 return lab
     return "Pisces"
@@ -250,10 +231,11 @@ def sign_from_ecliptic_lon(lon_deg: float, profile: str) -> str:
 def ecl_lon_from_app(app) -> float:
     """
     Skyfield apparent RA/Dec → ICRS → ecliptic J2000 → λ (deg 0..360).
-    Keep same frame as band map.
     """
     ra, dec, _ = app.radec()  # hours, degrees
-    sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle, dec=float(dec.degrees) * u.deg, frame=ICRS())
+    sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle,
+                       dec=float(dec.degrees) * u.deg,
+                       frame=ICRS())
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
@@ -427,17 +409,11 @@ def compute_chart(
     # 6) Nodes (mean)
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
+    nn_sign = sign_from_ecliptic_lon(nn_lon, profile)
+    sn_sign = sign_from_ecliptic_lon(sn_lon, profile)
     nodes = {
-        "north_node": {
-            "lon": nn_lon,
-            "sign": sign_from_ecliptic_lon(nn_lon, profile),
-            "house": house_number_for_sign(sign_from_ecliptic_lon(nn_lon, profile), asc_sign, mode),
-        },
-        "south_node": {
-            "lon": sn_lon,
-            "sign": sign_from_ecliptic_lon(sn_lon, profile),
-            "house": house_number_for_sign(sign_from_ecliptic_lon(sn_lon, profile), asc_sign, mode),
-        },
+        "north_node": {"lon": nn_lon, "sign": nn_sign, "house": house_number_for_sign(nn_sign, asc_sign, mode)},
+        "south_node": {"lon": sn_lon, "sign": sn_sign, "house": house_number_for_sign(sn_sign, asc_sign, mode)},
     }
 
     # 7) Midheaven
@@ -459,7 +435,7 @@ def compute_chart(
             }
         )
 
-    # 9) Houses (13 default)
+    # 9) Houses
     houses = build_houses(asc_sign, mode)
 
     payload = {
