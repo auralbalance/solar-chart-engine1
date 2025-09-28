@@ -5,8 +5,6 @@ import os
 from datetime import datetime, time as dtime
 from typing import Tuple, Dict, Any, Optional, List
 
-import numpy as np
-
 # Geo + TZ
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
@@ -23,7 +21,7 @@ from astropy.coordinates import (
     ICRS,
 )
 
-# Optional: Chiron via JPL Horizons. We fail gracefully if not available.
+# Optional: Chiron via JPL Horizons
 try:
     from astroquery.jplhorizons import Horizons  # type: ignore
     HAS_HORIZONS = True
@@ -31,26 +29,49 @@ except Exception:
     HAS_HORIZONS = False
 
 
-# ---------------------------------------------------------------------
-# EPHEMERIS LOADER (use de440s: includes Pluto center and modern accuracy)
-# ---------------------------------------------------------------------
+# =========================
+# EPHEMERIS + TARGET HELPERS
+# =========================
 def get_ephemeris():
     """
-    Load JPL DE440s ephemeris, cached under /tmp/skyfield-data (Railway-friendly).
+    Load a robust ephemeris, cached to /tmp/skyfield-data (Railway-friendly).
+    Preference: de441.bsp → de440.bsp → de421.bsp
     """
     data_dir = "/tmp/skyfield-data"
     os.makedirs(data_dir, exist_ok=True)
     load = Loader(data_dir)
-    return load("de440s.bsp"), load
+    for fname in ("de441.bsp", "de440.bsp", "de421.bsp"):
+        try:
+            eph = load(fname)
+            return eph, load, fname
+        except Exception:
+            continue
+    # Last resort: raise a clear error
+    raise RuntimeError("No ephemeris available (tried de441.bsp, de440.bsp, de421.bsp).")
 
 
-# ---------------------------------------------------------------------
-# GEO / TIME HELPERS
-# ---------------------------------------------------------------------
+def pick_key(eph, preferred: str, fallback: str) -> str:
+    """
+    Return preferred target key if present in eph, else fallback if present,
+    else raise helpful error.
+    """
+    try:
+        _ = eph[preferred]
+        return preferred
+    except Exception:
+        try:
+            _ = eph[fallback]
+            return fallback
+        except Exception:
+            raise KeyError(
+                f"Neither '{preferred}' nor '{fallback}' available in ephemeris."
+            )
+
+
+# =================
+# GEO / TIME
+# =================
 def geocode_place(place_text: str) -> Tuple[float, float, str]:
-    """
-    Resolve 'place' to (lat, lon, tz). Uses OpenStreetMap Nominatim + TimezoneFinder.
-    """
     geocoder = Nominatim(user_agent="solar-chart-api", timeout=15)
     loc = geocoder.geocode(place_text, addressdetails=False, language="en")
     if not loc:
@@ -66,10 +87,6 @@ def geocode_place(place_text: str) -> Tuple[float, float, str]:
 
 
 def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetime, bool]:
-    """
-    Convert local date/time + IANA tz → timezone-aware UTC datetime.
-    If time is None, default to 12:00 and set estimated flag True.
-    """
     est = False
     if not time_str:
         clock = dtime(12, 0)
@@ -85,15 +102,9 @@ def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetim
     return dt_loc.astimezone(utc), est
 
 
-# ---------------------------------------------------------------------
-# 13-SIGN MAPPING
-# We build ecliptic bands by sampling β=0° at J2000, mapping IAU constellations
-# to 13-sign labels. Everything else (planets, ASC, MC, Nodes, Chiron) is
-# computed and converted to ecliptic J2000 to match these bands exactly.
-# ---------------------------------------------------------------------
-
-# IAU → 13-sign label map
-# Libra→Libra, Scorpius→Scorpius, Ophiuchus included, Capricornus, etc.
+# ==========================
+# 13-SIGN IAU BAND MAPPING
+# ==========================
 CONSTELLATION_TO_13 = {
     "Aries": "Aries",
     "Taurus": "Taurus",
@@ -118,8 +129,8 @@ _ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # [(start_lon, end_lon, la
 
 def _build_ecliptic_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
     """
-    Sample β=0° points around the ecliptic at J2000 and record where the IAU constellation
-    (mapped to 13-sign) changes. Returns bands covering [0,360). Frame: ecliptic J2000.
+    Build bands by sampling β=0° around the ecliptic at J2000 and detecting constellation changes.
+    Output bands cover [0,360). Frame: ecliptic J2000.
     """
     bands: List[Tuple[float, float, str]] = []
     t = Time("J2000")
@@ -127,7 +138,7 @@ def _build_ecliptic_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str
     seg_start = 0.0
 
     n = int(360.0 / step_deg)
-    for i in range(n + 1):  # include 360
+    for i in range(n + 1):
         L = (i * step_deg) % 360.0
         sc = SkyCoord(
             lon=L * u.deg,
@@ -146,7 +157,7 @@ def _build_ecliptic_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str
     if current_label is not None:
         bands.append((seg_start, 360.0, current_label))
 
-    # Merge wrap if first and last share label
+    # Merge wrap if needed
     if bands and bands[0][2] == bands[-1][2]:
         first_s, first_e, lab = bands[0]
         last_s, last_e, _ = bands[-1]
@@ -163,11 +174,9 @@ def _ensure_bands_built():
 
 
 def sign_from_ecliptic_lon(lon_deg: float) -> str:
-    """Return 13-sign label for an ecliptic J2000 longitude using the precomputed bands."""
     _ensure_bands_built()
     x = lon_deg % 360.0
     for s, e, lab in _ECLIPTIC_BANDS:
-        # bands may include a negative start for the wrap segment
         if s < 0:
             if (0 <= x < e) or (x + 360.0 >= s and x + 360.0 < e):
                 return lab
@@ -177,26 +186,21 @@ def sign_from_ecliptic_lon(lon_deg: float) -> str:
     return "Pisces"  # should not happen
 
 
-# ---------------------------------------------------------------------
-# CORE ASTRONOMY HELPERS — all converted to ECLIPTIC J2000
-# ---------------------------------------------------------------------
+# ==========================
+# CORE ASTRONOMY (J2000 PIPE)
+# ==========================
 def ecl_lon_from_app(app) -> float:
     """
-    Apparent RA/Dec from Skyfield → ICRS → ecliptic J2000 → longitude in degrees [0..360).
-    Keeps the same frame as the precomputed IAU bands (J2000).
+    Skyfield apparent RA/Dec → ICRS → ecliptic J2000 → λ (deg 0..360).
+    Keep same frame as band map.
     """
     ra, dec, _ = app.radec()  # hours, degrees
-    sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle,
-                       dec=float(dec.degrees) * u.deg,
-                       frame=ICRS())
+    sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle, dec=float(dec.degrees) * u.deg, frame=ICRS())
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
 
 def mean_lunar_node_lon(dt_utc: datetime) -> float:
-    """
-    Mean lunar node longitude Ω (deg). Meeus-style approximation (good for labeling).
-    """
     t = Time(dt_utc).jd
     T = (t - 2451545.0) / 36525.0
     Omega = 125.04452 - 1934.136261 * T + 0.0020708 * T * T + (T ** 3) / 450000.0
@@ -204,9 +208,6 @@ def mean_lunar_node_lon(dt_utc: datetime) -> float:
 
 
 def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
-    """
-    MC: take local apparent sidereal time as RA on the meridian, convert to ecliptic J2000.
-    """
     obstime = Time(dt_utc)
     lst_deg = obstime.sidereal_time("apparent", longitude=lon_deg * u.deg).deg
     sc_icrs = SkyCoord(ra=lst_deg * u.deg, dec=0.0 * u.deg, frame=ICRS())
@@ -215,10 +216,6 @@ def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
 
 
 def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional[float]:
-    """
-    Chiron ecliptic longitude via JPL Horizons (topocentric if possible; else geocentric).
-    Returns None if Horizons unavailable/errors. Output is ecliptic J2000 longitude.
-    """
     if not HAS_HORIZONS:
         return None
     t = Time(dt_utc)
@@ -232,20 +229,18 @@ def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional
             eph = obj.ephemerides()
         except Exception:
             return None
-    ra = float(eph["RA"][0])
-    dec = float(eph["DEC"][0])
+    ra = float(eph["RA"][0]); dec = float(eph["DEC"][0])
     sc_icrs = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=ICRS())
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
     return float(ecl.lon.to(u.deg).value % 360.0)
 
 
-# ---------------------------------------------------------------------
-# ASCENDANT SOLVER (accurate) — returns ecliptic J2000 longitude
-# ---------------------------------------------------------------------
+# ==================
+# ASCENDANT SOLVER
+# ==================
 def compute_ascendant(ts, observer) -> float:
     """
-    Find ecliptic longitude (deg) of the rising point (β=0°, alt≈0°) on the EAST horizon.
-    Numerical search. All in ecliptic J2000 to match band mapping.
+    Solve the ecliptic J2000 longitude of the rising point (β=0°) on the EAST horizon.
     """
     def alt_az_of_ecl_lon_j2000(L_deg: float):
         sc_ecl = SkyCoord(lon=L_deg * u.deg, lat=0 * u.deg,
@@ -257,9 +252,9 @@ def compute_ascendant(ts, observer) -> float:
         alt, az, _ = app.altaz()
         return float(alt.degrees), float(az.degrees)
 
-    # coarse bracket on EAST side
+    # coarse
     best_L, best_abs = 0.0, 1e9
-    for L in range(0, 360, 2):  # 2° step
+    for L in range(0, 360, 2):
         alt, az = alt_az_of_ecl_lon_j2000(L)
         if 0.0 < az < 180.0:
             a = abs(alt)
@@ -269,7 +264,7 @@ def compute_ascendant(ts, observer) -> float:
     # refine
     step = 1.0
     L0 = best_L
-    for _ in range(12):  # ~millidegree
+    for _ in range(12):
         candidates = [L0 - step, L0, L0 + step]
         best = (1e9, L0)
         for L in candidates:
@@ -278,55 +273,53 @@ def compute_ascendant(ts, observer) -> float:
                 a = abs(alt)
                 if a < best[0]:
                     best = (a, L % 360.0)
-        L0 = best[1]
-        step *= 0.5
-
+        L0 = best[1]; step *= 0.5
     return L0 % 360.0
 
 
-# ---------------------------------------------------------------------
+# ===============
 # MAIN CHART
-# ---------------------------------------------------------------------
+# ===============
 def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> Tuple[Dict[str, Any], bool]:
     # 1) Geo + time
     lat, lon, tz_str = geocode_place(place)
     dt_utc, time_estimated = to_utc(date, time_str, tz_str)
 
-    # 2) Ephemeris + timescale + observer
-    eph, load = get_ephemeris()
+    # 2) Ephemeris + observer
+    eph, load, eph_name = get_ephemeris()
     ts = load.timescale().from_datetime(dt_utc)
     earth = eph["earth"]
     observer = earth + Topos(latitude_degrees=lat, longitude_degrees=lon)
 
-    # 3) Ascendant (solve) + sign via ecliptic bands
+    # 3) Resolve targets with fallbacks for this ephemeris
+    targets = {
+        "Sun": pick_key(eph, "sun", "10"),  # 10 is SUN id in many kernels
+        "Moon": pick_key(eph, "moon", "301"),
+        "Mercury": pick_key(eph, "mercury", "199"),
+        "Venus": pick_key(eph, "venus", "299"),
+        "Mars": pick_key(eph, "mars", "mars barycenter"),
+        "Jupiter": pick_key(eph, "jupiter", "jupiter barycenter"),
+        "Saturn": pick_key(eph, "saturn", "saturn barycenter"),
+        "Uranus": pick_key(eph, "uranus", "uranus barycenter"),
+        "Neptune": pick_key(eph, "neptune", "neptune barycenter"),
+        # Prefer Pluto center if present; else barycenter
+        "Pluto": pick_key(eph, "pluto", "pluto barycenter"),
+    }
+
+    # 4) Ascendant
     asc_lon = compute_ascendant(ts, observer)
     asc_sign = sign_from_ecliptic_lon(asc_lon)
     ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign}
 
-    # 4) Planets (apparent; convert to ecliptic J2000; use Pluto center)
-    targets = {
-        "Sun": "sun",
-        "Moon": "moon",
-        "Mercury": "mercury",
-        "Venus": "venus",
-        "Mars": "mars",
-        "Jupiter": "jupiter barycenter",
-        "Saturn": "saturn barycenter",
-        "Uranus": "uranus barycenter",
-        "Neptune": "neptune barycenter",
-        "Pluto": "pluto",  # needs de440s.bsp
-    }
-
+    # 5) Planets → ecliptic J2000
     planets: List[Dict[str, Any]] = []
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
         sign13 = sign_from_ecliptic_lon(L)
-        planets.append(
-            {"body": label, "lon": L, "sign": sign13, "constellation": sign13}
-        )
+        planets.append({"body": label, "lon": L, "sign": sign13, "constellation": sign13})
 
-    # 5) Nodes (mean) — convert Ω to sign using same mapper
+    # 6) Nodes (mean)
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
     nodes = {
@@ -334,11 +327,11 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
         "south_node": {"lon": sn_lon, "sign": sign_from_ecliptic_lon(sn_lon)},
     }
 
-    # 6) Midheaven
+    # 7) Midheaven
     mc_lon = midheaven_lon(dt_utc, lon)
     mc = {"lon": mc_lon, "sign": sign_from_ecliptic_lon(mc_lon)}
 
-    # 7) Chiron (optional)
+    # 8) Chiron (optional)
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
         planets.append(
@@ -350,27 +343,15 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
             }
         )
 
-    # 8) Houses: whole-sign starting from ASC sign.
-    # You are outputting 12 houses on a 13-sign belt. That’s fine, but be explicit in UI.
+    # 9) Houses: whole-sign from ASC, 12 houses on 13-sign belt (explicit by design)
     SIGNS_13 = [
-        "Aries",
-        "Taurus",
-        "Gemini",
-        "Cancer",
-        "Leo",
-        "Virgo",
-        "Libra",
-        "Scorpius",
-        "Ophiuchus",
-        "Sagittarius",
-        "Capricornus",
-        "Aquarius",
-        "Pisces",
+        "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+        "Libra", "Scorpius", "Ophiuchus", "Sagittarius",
+        "Capricornus", "Aquarius", "Pisces",
     ]
     start_idx = SIGNS_13.index(asc_sign)
     houses = [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(12)]
 
-    # 9) Payload
     payload = {
         "name": name,
         "datetime_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -381,7 +362,7 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
         "planets": planets,
         "houses": houses,
         "frames": {"ecliptic_bands": "J2000", "positions": "J2000"},
-        "ephemeris": "de440s.bsp",
+        "ephemeris": eph_name,
         "house_model": "Whole-sign start from ASC, 12 houses on 13-sign belt",
         "time_estimated": time_estimated,
     }
