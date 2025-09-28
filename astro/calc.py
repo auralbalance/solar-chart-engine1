@@ -7,7 +7,7 @@ import numpy as np
 from astropy.coordinates import SkyCoord, get_constellation, AltAz, EarthLocation, GeocentricTrueEcliptic
 from astropy import units as u
 from astropy.time import Time
-from .signs import constellation_to_13sign, cycle_from
+from .signs import constellation_to_13sign, cycle_from, sign_from_ecliptic_lon
 
 LOADER = Loader("./skyfield_data")  # caches ephemeris here
 
@@ -66,14 +66,18 @@ def compute_chart(name:str, date:str, time_str:str|None, place:str):
         ra, dec, _ = app.radec()
         sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
         const = get_constellation(sc)
-        planets.append({'body': name_b, 'lon': lon_ecl, 'sign': constellation_to_13sign(const), 'constellation': const})
+        # Map Serpens -> Ophiuchus then ALSO compute sign from ecliptic longitude
+        const_mapped = constellation_to_13sign(const)
+        sign = sign_from_ecliptic_lon(lon_ecl)
+        planets.append({'body': name_b, 'lon': lon_ecl, 'sign': sign, 'constellation': const_mapped})
 
     asc_lon = ascendant_lon_accurate(dt_utc, lat, lon)
     ecl_sc = SkyCoord(lon=asc_lon*u.deg, lat=0*u.deg, frame=GeocentricTrueEcliptic(equinox=Time(dt_utc)))
     icrs_sc = ecl_sc.transform_to('icrs')
     asc_const = get_constellation(icrs_sc)
-    asc_sign = constellation_to_13sign(asc_const)
-    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': asc_const}
+    asc_sign = sign_from_ecliptic_lon(asc_lon)
+    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': constellation_to_13sign(asc_const)}
+
 
     houses = [{'house': i+1, 'sign': cycle_from(asc_sign,12)[i]} for i in range(12)]
 
