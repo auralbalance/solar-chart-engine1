@@ -1,8 +1,9 @@
 # astro/calc.py
 from __future__ import annotations
-import os, json
+import os, json, time
 from datetime import datetime, time as dtime
 from typing import Tuple, Dict, Any, Optional, List
+from functools import lru_cache
 
 # Geo + TZ
 from geopy.geocoders import Nominatim
@@ -31,7 +32,13 @@ except Exception:
 # =========================
 # EPHEMERIS + TARGET HELPERS
 # =========================
+@lru_cache(maxsize=1)
 def get_ephemeris():
+    """
+    Load a robust ephemeris, cached to /tmp/skyfield-data (Railway-friendly).
+    Preference: de441.bsp → de440.bsp → de421.bsp
+    Cached with lru_cache so it loads once per process.
+    """
     data_dir = "/tmp/skyfield-data"
     os.makedirs(data_dir, exist_ok=True)
     load = Loader(data_dir)
@@ -57,9 +64,22 @@ def pick_key(eph, preferred: str, fallback: str) -> str:
 
 
 # =================
-# GEO / TIME
+# GEO / TIME  (caching)
 # =================
+_GEO_CACHE: Dict[str, Tuple[float, float, str, float]] = {}
+_GEO_TTL = float(os.getenv("GEOCODE_TTL_SECONDS", "604800"))  # 7 days default
+
 def geocode_place(place_text: str) -> Tuple[float, float, str]:
+    """
+    Resolve 'place' to (lat, lon, tz). In-memory cache with TTL.
+    """
+    key = place_text.strip().lower()
+    now = time.time()
+    hit = _GEO_CACHE.get(key)
+    if hit and (now - hit[3] < _GEO_TTL):
+        lat, lon, tz = hit[0], hit[1], hit[2]
+        return lat, lon, tz
+
     geocoder = Nominatim(user_agent="solar-chart-api", timeout=15)
     loc = geocoder.geocode(place_text, addressdetails=False, language="en")
     if not loc:
@@ -71,6 +91,8 @@ def geocode_place(place_text: str) -> Tuple[float, float, str]:
     tz = tf.timezone_at(lng=lon, lat=lat)
     if not tz:
         raise ValueError("Timezone not found for the given location.")
+
+    _GEO_CACHE[key] = (lat, lon, tz, now)
     return lat, lon, tz
 
 
@@ -109,9 +131,9 @@ CONSTELLATION_TO_13 = {
     "Pisces": "Pisces",
 }
 SIGNS_13 = [
-    "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
-    "Libra","Scorpius","Ophiuchus","Sagittarius",
-    "Capricornus","Aquarius","Pisces",
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpius", "Ophiuchus", "Sagittarius",
+    "Capricornus", "Aquarius", "Pisces",
 ]
 
 def constellation_to_13sign(iau_name: str) -> str:
@@ -128,7 +150,7 @@ DEFAULT_CUSTOM_BANDS: List[Tuple[float, float, str]] = [
     (204.0, 241.0, "Libra"),
     (241.0, 252.0, "Scorpius"),
     (252.0, 266.0, "Ophiuchus"),
-    (266.0, 306.0, "Sagittarius"),
+    (266.0, 306.0, "Sagittarius"),   # NN ~301° → Sagittarius
     (306.0, 326.0, "Capricornus"),
     (326.0, 353.0, "Aquarius"),
     (353.0, 360.0, "Pisces"),
@@ -150,12 +172,10 @@ def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
                       frame=GeocentricTrueEcliptic(equinox=t)).icrs
         label = constellation_to_13sign(get_constellation(sc))
         if current_label is None:
-            current_label = label
-            seg_start = L
+            current_label = label; seg_start = L
         elif label != current_label:
             bands.append((seg_start, L, current_label))
-            seg_start = L
-            current_label = label
+            seg_start = L; current_label = label
     if current_label is not None:
         bands.append((seg_start, 360.0, current_label))
     if bands and bands[0][2] == bands[-1][2]:
@@ -204,28 +224,6 @@ def sign_from_ecliptic_lon(lon_deg: float, profile: str) -> str:
 
 
 # ==========================
-# OVERRIDES
-# ==========================
-def load_sign_overrides() -> Dict[str, str]:
-    """
-    Read SIGN_OVERRIDES env as JSON like {"Chiron":"Gemini"}.
-    Keys match body names: Sun Moon Mercury Venus Mars Jupiter Saturn Uranus Neptune Pluto Chiron
-    Also accepts "north_node", "south_node", "Midheaven", "Ascendant".
-    """
-    raw = os.getenv("SIGN_OVERRIDES")
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        out = {}
-        for k, v in data.items():
-            out[str(k)] = str(v)
-        return out
-    except Exception:
-        return {}
-
-
-# ==========================
 # CORE ASTRONOMY (J2000 PIPE)
 # ==========================
 def ecl_lon_from_app(app) -> float:
@@ -252,26 +250,20 @@ def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
     return float(ecl.lon.to(u.deg).value % 360.0)
 
 
-def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float, mode: str) -> Optional[float]:
-    """
-    mode: 'topo' topocentric using local site
-          'geo' geocentric
-          'off' skip
-    """
-    if mode == "off":
-        return None
+def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional[float]:
     if not HAS_HORIZONS:
         return None
     t = Time(dt_utc)
+    loc_str = f"{lon_deg},{lat_deg},0"
     try:
-        if mode == "geo":
-            obj = Horizons(id="2060", id_type="smallbody", location="geo", epochs=t.jd)
-        else:
-            loc_str = f"{lon_deg},{lat_deg},0"
-            obj = Horizons(id="2060", id_type="smallbody", location=loc_str, epochs=t.jd)
+        obj = Horizons(id="2060", id_type="smallbody", location=loc_str, epochs=t.jd)
         eph = obj.ephemerides()
     except Exception:
-        return None
+        try:
+            obj = Horizons(id="2060", id_type="smallbody", location="geo", epochs=t.jd)
+            eph = obj.ephemerides()
+        except Exception:
+            return None
     ra = float(eph["RA"][0]); dec = float(eph["DEC"][0])
     sc_icrs = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=ICRS())
     ecl = sc_icrs.transform_to(GeocentricTrueEcliptic(equinox=Time("J2000")))
@@ -316,7 +308,7 @@ def compute_ascendant(ts, observer) -> float:
 
 
 # ===============
-# HOUSES
+# HOUSES (13 default)
 # ===============
 def build_houses(asc_sign: str, mode: str) -> List[Dict[str, Any]]:
     if mode not in ("12", "13"):
@@ -346,12 +338,10 @@ def compute_chart(
     zodiac_profile: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """
-    Defaults: 13 houses on CUSTOM_13 zodiac
+    Defaults: 13 houses on CUSTOM_13 zodiac.
     Env switches:
       HOUSE_MODE = 12 or 13
       ZODIAC_PROFILE = IAU_13 or CUSTOM_13
-      CHIRON_MODE = topo or geo or off
-      SIGN_OVERRIDES = JSON, e.g. {"Chiron":"Gemini"}
     """
     mode = (house_mode or os.getenv("HOUSE_MODE") or "13").strip().lower()
     mode = "13" if mode in ("13","h13","thirteen") else "12"
@@ -359,12 +349,6 @@ def compute_chart(
     profile = (zodiac_profile or os.getenv("ZODIAC_PROFILE") or "CUSTOM_13").strip().upper()
     if profile not in ("IAU_13","CUSTOM_13"):
         profile = "CUSTOM_13"
-
-    chiron_mode = (os.getenv("CHIRON_MODE") or "topo").strip().lower()
-    if chiron_mode not in ("topo","geo","off"):
-        chiron_mode = "topo"
-
-    overrides = load_sign_overrides()
 
     # 1) Geo + time
     lat, lon, tz_str = geocode_place(place)
@@ -392,7 +376,7 @@ def compute_chart(
 
     # 4) Ascendant
     asc_lon = compute_ascendant(ts, observer)
-    asc_sign = overrides.get("Ascendant", sign_from_ecliptic_lon(asc_lon, profile))
+    asc_sign = sign_from_ecliptic_lon(asc_lon, profile)
     ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign, "house": 1}
 
     # 5) Planets
@@ -401,7 +385,6 @@ def compute_chart(
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
         sign13 = sign_from_ecliptic_lon(L, profile)
-        sign13 = overrides.get(label, sign13)
         planets.append({
             "body": label,
             "lon": L,
@@ -413,8 +396,8 @@ def compute_chart(
     # 6) Nodes
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
-    nn_sign = overrides.get("north_node", sign_from_ecliptic_lon(nn_lon, profile))
-    sn_sign = overrides.get("south_node", sign_from_ecliptic_lon(sn_lon, profile))
+    nn_sign = sign_from_ecliptic_lon(nn_lon, profile)
+    sn_sign = sign_from_ecliptic_lon(sn_lon, profile)
     nodes = {
         "north_node": {"lon": nn_lon, "sign": nn_sign, "house": house_number_for_sign(nn_sign, asc_sign, mode)},
         "south_node": {"lon": sn_lon, "sign": sn_sign, "house": house_number_for_sign(sn_sign, asc_sign, mode)},
@@ -422,14 +405,13 @@ def compute_chart(
 
     # 7) Midheaven
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc_sign = overrides.get("Midheaven", sign_from_ecliptic_lon(mc_lon, profile))
+    mc_sign = sign_from_ecliptic_lon(mc_lon, profile)
     mc = {"lon": mc_lon, "sign": mc_sign, "house": house_number_for_sign(mc_sign, asc_sign, mode)}
 
-    # 8) Chiron
-    chi_lon = chiron_ecl_lon(dt_utc, lat, lon, chiron_mode)
+    # 8) Chiron (optional via Horizons)
+    chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
         chi_sign = sign_from_ecliptic_lon(chi_lon, profile)
-        chi_sign = overrides.get("Chiron", chi_sign)
         planets.append({
             "body": "Chiron",
             "lon": chi_lon,
@@ -437,17 +419,6 @@ def compute_chart(
             "constellation": chi_sign,
             "house": house_number_for_sign(chi_sign, asc_sign, mode),
         })
-    else:
-        # still honor override even if Horizons unavailable or off
-        if "Chiron" in overrides:
-            chi_sign = overrides["Chiron"]
-            planets.append({
-                "body": "Chiron",
-                "lon": None,
-                "sign": chi_sign,
-                "constellation": chi_sign,
-                "house": house_number_for_sign(chi_sign, asc_sign, mode),
-            })
 
     # 9) Houses
     houses = build_houses(asc_sign, mode)
