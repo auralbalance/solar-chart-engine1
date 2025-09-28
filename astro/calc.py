@@ -1,6 +1,6 @@
 # astro/calc.py
 from __future__ import annotations
-import os, json, time
+import os, time
 from datetime import datetime, time as dtime
 from typing import Tuple, Dict, Any, Optional, List
 from functools import lru_cache
@@ -34,10 +34,6 @@ except Exception:
 # =========================
 @lru_cache(maxsize=1)
 def get_ephemeris():
-    """
-    Load robust ephemeris, cached in /tmp/skyfield-data (Railway-friendly).
-    Preference: de441.bsp → de440.bsp → de421.bsp
-    """
     data_dir = "/tmp/skyfield-data"
     os.makedirs(data_dir, exist_ok=True)
     load = Loader(data_dir)
@@ -51,7 +47,6 @@ def get_ephemeris():
 
 
 def pick_key(eph, preferred: str, fallback: str) -> str:
-    """Return preferred target key if present; else fallback; else raise."""
     try:
         _ = eph[preferred]
         return preferred
@@ -70,9 +65,6 @@ _GEO_CACHE: Dict[str, Tuple[float, float, str, float]] = {}
 _GEO_TTL = float(os.getenv("GEOCODE_TTL_SECONDS", "604800"))  # 7 days
 
 def geocode_place(place_text: str) -> Tuple[float, float, str]:
-    """
-    Resolve 'place' to (lat, lon, tz). In-memory cache with TTL.
-    """
     key = place_text.strip().lower()
     now = time.time()
     hit = _GEO_CACHE.get(key)
@@ -96,10 +88,6 @@ def geocode_place(place_text: str) -> Tuple[float, float, str]:
 
 
 def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetime, bool]:
-    """
-    Convert local date/time + IANA tz → timezone-aware UTC datetime.
-    If time is None, default to 12:00 and set estimated flag True.
-    """
     est = False
     if not time_str:
         clock = dtime(12, 0)
@@ -116,83 +104,93 @@ def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetim
 
 
 # ==========================
-# SIGN CANON (IAU → 13 canonical), typo-proof
+# CANONICAL 13-SIGN NAMES
 # ==========================
-CONSTELLATION_TO_13 = {
-    "Aries": "Aries",
-    "Taurus": "Taurus",
-    "Gemini": "Gemini",
-    "Cancer": "Cancer",
-    "Leo": "Leo",
-    "Virgo": "Virgo",
-    "Libra": "Libra",
-    "Scorpius": "Scorpius",
-    "Ophiuchus": "Ophiuchus",
-    "Sagittarius": "Sagittarius",
-    "Capricornus": "Capricornus",
-    "Aquarius": "Aquarius",
-    "Pisces": "Pisces",
-}
 SIGNS_13 = [
     "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
     "Libra","Scorpius","Ophiuchus","Sagittarius",
     "Capricornus","Aquarius","Pisces",
 ]
-
-# common incoming variants → canonical
-_ALIAS = {
-    "scorpio": "Scorpius",
-    "capricorn": "Capricornus",
-    "ophiucus": "Ophiuchus",   # missing 'h'
-    "ophiuchus": "Ophiuchus",
-    "ophiu chus": "Ophiuchus",
-    "ophiucus ": "Ophiuchus",
+CONSTELLATION_TO_13 = {
+    "Aries": "Aries", "Taurus": "Taurus", "Gemini": "Gemini", "Cancer": "Cancer",
+    "Leo": "Leo", "Virgo": "Virgo", "Libra": "Libra", "Scorpius": "Scorpius",
+    "Ophiuchus": "Ophiuchus", "Sagittarius": "Sagittarius", "Capricornus": "Capricornus",
+    "Aquarius": "Aquarius", "Pisces": "Pisces",
 }
-
 def canon_sign(name: str) -> str:
-    s = str(name).strip()
-    low = s.lower().replace("’","'").replace("`","'")
-    if low in _ALIAS:
-        return _ALIAS[low]
-    if low.startswith("ophiu"):
-        return "Ophiuchus"
-    if low.startswith("scorp"):
-        return "Scorpius"
-    if low.startswith("capricor"):
-        return "Capricornus"
-    # direct match ignoring case
-    for sign in SIGNS_13:
-        if low == sign.lower():
-            return sign
-    # last resort: title-case
-    return s[:1].upper() + s[1:].lower()
+    n = str(name).strip()
+    low = n.lower()
+    if low.startswith("scorp"): return "Scorpius"
+    if low.startswith("capricor"): return "Capricornus"
+    if low.startswith("ophiu"): return "Ophiuchus"
+    for s in SIGNS_13:
+        if low == s.lower(): return s
+    return n[:1].upper() + n[1:].lower()
 
 
 # ==========================
-# TRUE-SKY CLASSIFIERS
+# IAU ECLIPTIC BANDS (β=0°)
 # ==========================
-def sign_from_icrs(ra_hours: float, dec_degrees: float) -> str:
-    """
-    Classify by IAU constellation from ICRS RA/Dec, then canonicalize to 13-sign label.
-    """
-    sc_icrs = SkyCoord(ra=ra_hours * u.hourangle, dec=dec_degrees * u.deg, frame=ICRS())
-    iau = get_constellation(sc_icrs)
-    return canon_sign(CONSTELLATION_TO_13.get(iau, iau))
+# Build once at startup by sampling the ecliptic and recording where the IAU constellation changes.
+_ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # (start, end, label)
 
-def sign_from_ecl_lon(lon_deg: float) -> str:
-    """
-    Classify an ecliptic point by converting λ (lat=0°, J2000) → ICRS → IAU constellation.
-    """
-    sc_ecl = SkyCoord(lon=lon_deg * u.deg, lat=0.0 * u.deg,
-                      frame=GeocentricTrueEcliptic(equinox=Time("J2000")))
-    iau = get_constellation(sc_ecl.icrs)
-    return canon_sign(CONSTELLATION_TO_13.get(iau, iau))
+def _build_ecliptic_bands(step_deg: float = 0.05) -> List[Tuple[float, float, str]]:
+    bands: List[Tuple[float, float, str]] = []
+    t = Time("J2000")
+    current_label: Optional[str] = None
+    seg_start = 0.0
+    n = int(360.0 / step_deg)
+
+    for i in range(n + 1):
+        L = (i * step_deg) % 360.0
+        sc = SkyCoord(lon=L * u.deg, lat=0.0 * u.deg,
+                      frame=GeocentricTrueEcliptic(equinox=t)).icrs
+        iau = get_constellation(sc)
+        label = CONSTELLATION_TO_13.get(iau)
+        if label is None:
+            # off-belt returns (e.g., Serpens) never occur at β=0°, but guard anyway:
+            # snap unknowns to the previous known segment to keep continuity
+            label = current_label if current_label is not None else "Pisces"
+        if current_label is None:
+            current_label = label; seg_start = L
+        elif label != current_label:
+            bands.append((seg_start, L, current_label))
+            seg_start = L; current_label = label
+
+    if current_label is not None:
+        bands.append((seg_start, 360.0, current_label))
+
+    # merge wrap if first and last share the same label
+    if bands and bands[0][2] == bands[-1][2]:
+        first_s, first_e, lab = bands[0]
+        last_s, last_e, _ = bands[-1]
+        bands = [(last_s - 360.0, first_e, lab)] + bands[1:-1]
+
+    bands.sort(key=lambda x: x[0])
+    return bands
 
 
+def _ensure_bands():
+    global _ECLIPTIC_BANDS
+    if not _ECLIPTIC_BANDS:
+        _ECLIPTIC_BANDS = _build_ecliptic_bands(step_deg=0.05)
+
+
+def sign_from_ecliptic_lon(lon_deg: float) -> str:
+    _ensure_bands()
+    x = lon_deg % 360.0
+    for s, e, lab in _ECLIPTIC_BANDS:
+        if s <= e:
+            if s <= x < e: return lab
+        else:
+            if x >= s or x < e: return lab
+    return "Pisces"  # fallback, should not hit
+
+
+# ==========================
+# CORE ASTRONOMY (λ on J2000 ecliptic)
+# ==========================
 def ecl_lon_from_app(app) -> float:
-    """
-    Skyfield apparent RA/Dec → ICRS → ecliptic J2000 → λ (deg 0..360) for wheels.
-    """
     ra, dec, _ = app.radec()
     sc_icrs = SkyCoord(ra=float(ra.hours) * u.hourangle,
                        dec=float(dec.degrees) * u.deg,
@@ -209,9 +207,6 @@ def mean_lunar_node_lon(dt_utc: datetime) -> float:
 
 
 def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
-    """
-    Midheaven: ecliptic longitude of upper culmination using apparent sidereal time, then to J2000 ecliptic.
-    """
     obstime = Time(dt_utc)
     lst_deg = obstime.sidereal_time("apparent", longitude=lon_deg * u.deg).deg
     sc_icrs = SkyCoord(ra=lst_deg * u.deg, dec=0.0 * u.deg, frame=ICRS())
@@ -220,9 +215,6 @@ def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
 
 
 def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional[float]:
-    """
-    Chiron ecliptic longitude via JPL Horizons (topocentric if possible; else geocentric).
-    """
     if not HAS_HORIZONS:
         return None
     t = Time(dt_utc)
@@ -246,9 +238,6 @@ def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional
 # ASCENDANT SOLVER
 # ==================
 def compute_ascendant(ts, observer) -> float:
-    """
-    Solve the ecliptic J2000 longitude of the rising point (β=0°) on the EAST horizon.
-    """
     def alt_az_of_ecl_lon_j2000(L_deg: float):
         sc_ecl = SkyCoord(lon=L_deg * u.deg, lat=0 * u.deg,
                           frame=GeocentricTrueEcliptic(equinox=Time("J2000")))
@@ -259,7 +248,6 @@ def compute_ascendant(ts, observer) -> float:
         alt, az, _ = app.altaz()
         return float(alt.degrees), float(az.degrees)
 
-    # coarse bracket
     best_L, best_abs = 0.0, 1e9
     for L in range(0, 360, 2):
         alt, az = alt_az_of_ecl_lon_j2000(L)
@@ -268,7 +256,6 @@ def compute_ascendant(ts, observer) -> float:
             if a < best_abs:
                 best_abs, best_L = a, L
 
-    # refine
     step = 1.0
     L0 = best_L
     for _ in range(12):
@@ -293,29 +280,14 @@ def build_houses_13(asc_sign: str) -> List[Dict[str, Any]]:
     return [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(13)]
 
 def house_number_for_sign_13(sign: str, asc_sign: str) -> int:
-    """
-    Return 1..13. Robust to common typos/variants.
-    """
-    sign = canon_sign(sign)
-    asc_sign = canon_sign(asc_sign)
-    if sign not in SIGNS_13:
-        # never 500—fallback heuristics keep charts rendering
-        if sign.lower().startswith("ophiu"):
-            sign = "Ophiuchus"
-        elif sign.lower().startswith("scorp"):
-            sign = "Scorpius"
-        elif sign.lower().startswith("capricor"):
-            sign = "Capricornus"
-        else:
-            # if still unknown, treat as Pisces for indexing (rare)
-            sign = "Pisces"
+    sign = canon_sign(sign); asc_sign = canon_sign(asc_sign)
     asc_i = SIGNS_13.index(asc_sign)
     sign_i = SIGNS_13.index(sign)
     return ((sign_i - asc_i) % 13) + 1
 
 
 # ===============
-# MAIN CHART (true sky; 13 houses only)
+# MAIN CHART (true sky; 13 houses only; signs from IAU ecliptic bands)
 # ===============
 def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> Tuple[Dict[str, Any], bool]:
     # 1) Geo + time
@@ -330,10 +302,10 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
 
     # 3) Ascendant
     asc_lon = compute_ascendant(ts, observer)
-    asc_sign = sign_from_ecl_lon(asc_lon)
+    asc_sign = sign_from_ecliptic_lon(asc_lon)
     ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign, "house": 1}
 
-    # 4) Planets (true sky sign via IAU; λ for wheels)
+    # 4) Planets — classify by ecliptic longitude bands (never off-belt)
     targets = {
         "Sun":      pick_key(eph, "sun", "10"),
         "Moon":     pick_key(eph, "moon", "301"),
@@ -350,9 +322,8 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
     planets: List[Dict[str, Any]] = []
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
-        ra, dec, _ = app.radec()
-        sign13 = sign_from_icrs(float(ra.hours), float(dec.degrees))
         L = ecl_lon_from_app(app)
+        sign13 = sign_from_ecliptic_lon(L)
         planets.append({
             "body": label,
             "lon": L,
@@ -361,25 +332,25 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
             "house": house_number_for_sign_13(sign13, asc_sign),
         })
 
-    # 5) Nodes (mean) → classify by constellation from λ
+    # 5) Nodes — mean; classify by ecliptic bands
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
-    nn_sign = sign_from_ecl_lon(nn_lon)
-    sn_sign = sign_from_ecl_lon(sn_lon)
+    nn_sign = sign_from_ecliptic_lon(nn_lon)
+    sn_sign = sign_from_ecliptic_lon(sn_lon)
     nodes = {
         "north_node": {"lon": nn_lon, "sign": nn_sign, "house": house_number_for_sign_13(nn_sign, asc_sign)},
         "south_node": {"lon": sn_lon, "sign": sn_sign, "house": house_number_for_sign_13(sn_sign, asc_sign)},
     }
 
-    # 6) Midheaven
+    # 6) Midheaven — classify by ecliptic bands
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc_sign = sign_from_ecl_lon(mc_lon)
+    mc_sign = sign_from_ecliptic_lon(mc_lon)
     mc = {"lon": mc_lon, "sign": mc_sign, "house": house_number_for_sign_13(mc_sign, asc_sign)}
 
-    # 7) Chiron (Horizons)
+    # 7) Chiron (Horizons) — classify by ecliptic bands
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
-        chi_sign = sign_from_ecl_lon(chi_lon)
+        chi_sign = sign_from_ecliptic_lon(chi_lon)
         planets.append({
             "body": "Chiron",
             "lon": chi_lon,
@@ -388,7 +359,7 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
             "house": house_number_for_sign_13(chi_sign, asc_sign),
         })
 
-    # 8) Houses: 13 only
+    # 8) Houses
     houses = build_houses_13(asc_sign)
 
     payload = {
@@ -400,7 +371,7 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
         "nodes": nodes,
         "planets": planets,
         "houses": houses,
-        "frames": {"positions": "ICRS→Ecliptic J2000 for λ; signs from IAU constellations"},
+        "frames": {"positions": "ICRS→Ecliptic J2000 for λ; signs from IAU ecliptic bands (β=0°)"},
         "ephemeris": eph_name,
         "house_model": "13 houses, whole-sign, one house per constellation sign",
         "time_estimated": time_estimated,
