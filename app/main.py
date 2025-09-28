@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from astro.calc import compute_chart
 from astro.wheel import make_svg_wheel
 
+os.makedirs("static", exist_ok=True)
+os.makedirs("skyfield_data", exist_ok=True)
+
 class ChartRequest(BaseModel):
     name: str
     date: str            # YYYY-MM-DD
@@ -14,6 +17,7 @@ class ChartRequest(BaseModel):
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 @app.post("/chart")
 async def chart_endpoint(req: ChartRequest):
