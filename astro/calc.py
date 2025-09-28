@@ -1,25 +1,57 @@
 # astro/calc.py
 
+from __future__ import annotations
 import os
 from datetime import datetime, time as dtime
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 import numpy as np
+
+# Geocoding & timezones
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 from pytz import timezone as tzlib, utc
 
-from skyfield.api import Loader, Topos
-from astropy.time import Time
+# Astronomy
+from skyfield.api import Loader, Topos, Star
 from astropy import units as u
-from astropy.coordinates import SkyCoord, GeocentricTrueEcliptic, get_constellation
-from astroquery.jplhorizons import Horizons
+from astropy.time import Time
+from astropy.coordinates import (
+    SkyCoord,
+    GeocentricTrueEcliptic,
+    get_constellation,
+)
 
-from .signs import constellation_to_13sign, cycle_from, sign_from_ecliptic_lon
+# Chiron (optional; we fail gracefully if not available)
+try:
+    from astroquery.jplhorizons import Horizons  # noqa: F401
+    HAS_HORIZONS = True
+except Exception:
+    HAS_HORIZONS = False
+
+# Your 13-sign helpers (mapping IAU -> 13 names and a small utility)
+from .signs import constellation_to_13sign
 
 
 # --------------------------
-# EPHEMERIS LOADER (Skyfield)
+# Small utilities
+# --------------------------
+def cycle_from(start: str, n: int) -> list[str]:
+    """Cycle 13-sign list starting from `start`, returning `n` items."""
+    SIGNS_13 = [
+        "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+        "Libra", "Scorpius", "Ophiuchus", "Sagittarius",
+        "Capricornus", "Aquarius", "Pisces"
+    ]
+    i = SIGNS_13.index(start)
+    out = []
+    for k in range(n):
+        out.append(SIGNS_13[(i + k) % 13])
+    return out
+
+
+# --------------------------
+# Ephemeris loader (Skyfield)
 # --------------------------
 def get_ephemeris():
     """
@@ -32,7 +64,7 @@ def get_ephemeris():
 
 
 # --------------------------
-# GEO + TIME HELPERS
+# Geo + time helpers
 # --------------------------
 def geocode_place(place_text: str) -> Tuple[float, float, str]:
     """
@@ -53,7 +85,7 @@ def geocode_place(place_text: str) -> Tuple[float, float, str]:
     return lat, lon, tz
 
 
-def to_utc(date_str: str, time_str: str | None, tz_str: str) -> Tuple[datetime, bool]:
+def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetime, bool]:
     """
     Convert local date/time + IANA tz → timezone-aware UTC datetime.
     If time is None, default to 12:00 and set estimated flag True.
@@ -74,7 +106,7 @@ def to_utc(date_str: str, time_str: str | None, tz_str: str) -> Tuple[datetime, 
 
 
 # --------------------------
-# ASTRONOMY HELPERS
+# Astronomy helpers
 # --------------------------
 def ecl_lon_from_skyfield(app) -> float:
     """
@@ -82,20 +114,6 @@ def ecl_lon_from_skyfield(app) -> float:
     """
     ecl = app.ecliptic_latlon()
     return float(ecl[1].degrees % 360.0)
-
-
-def compute_ascendant(ts, observer, tt, lat_deg: float, lon_deg: float) -> float:
-    """
-    Simple MVP ascendant longitude.
-    Uses local apparent sidereal time to approximate the ecliptic longitude
-    rising at the eastern horizon. (Good enough for v1.)
-    """
-    # Skyfield time object has gmst; convert to local sidereal time (hours)
-    lst_hours = (ts.gmst + (lon_deg / 15.0)) % 24.0
-    # Convert to degrees along the equator, then approximate to ecliptic lon
-    # A more exact solution uses horizon intersection; for MVP this is acceptable.
-    asc_approx = (lst_hours * 15.0) % 360.0
-    return float(asc_approx)
 
 
 def mean_lunar_node_lon(dt_utc: datetime) -> float:
@@ -129,19 +147,25 @@ def midheaven_lon(dt_utc: datetime, lon_deg: float) -> float:
     return Lmc
 
 
-def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> float:
+def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> Optional[float]:
     """
     Get Chiron topocentric apparent RA/Dec from JPL Horizons, convert to ecliptic lon (deg).
-    Falls back to geocentric if topocentric fails.
+    Falls back to geocentric if topocentric fails. Returns None if Horizons unavailable.
     """
+    if not HAS_HORIZONS:
+        return None
+
     loc_str = f"{lon_deg},{lat_deg},0"  # lon,lat,elv(m)
     t = Time(dt_utc)
     try:
         obj = Horizons(id='2060', id_type='smallbody', location=loc_str, epochs=t.jd)
         eph = obj.ephemerides()
     except Exception:
-        obj = Horizons(id='2060', id_type='smallbody', location='geo', epochs=t.jd)
-        eph = obj.ephemerides()
+        try:
+            obj = Horizons(id='2060', id_type='smallbody', location='geo', epochs=t.jd)
+            eph = obj.ephemerides()
+        except Exception:
+            return None
 
     ra = float(eph['RA'][0])   # deg
     dec = float(eph['DEC'][0]) # deg
@@ -151,9 +175,56 @@ def chiron_ecl_lon(dt_utc: datetime, lat_deg: float, lon_deg: float) -> float:
 
 
 # --------------------------
-# MAIN CHART COMPUTATION
+# Ascendant solver (accurate)
 # --------------------------
-def compute_chart(name: str, date: str, time_str: str | None, place: str) -> Tuple[Dict[str, Any], bool]:
+def compute_ascendant(ts, observer, lat_deg: float, lon_deg: float) -> float:
+    """
+    Find the ecliptic longitude (deg) where the ecliptic (lat=0) rises at the local
+    eastern horizon (alt≈0°, 0°<az<180°). Numeric search using Skyfield's alt/az.
+    """
+
+    def alt_az_of_ecl_lon(L_deg: float) -> Tuple[float, float]:
+        t = Time(ts.utc_datetime())
+        sc = SkyCoord(lon=L_deg*u.deg, lat=0*u.deg,
+                      frame=GeocentricTrueEcliptic(equinox=t))
+        icrs = sc.icrs
+        star = Star(ra_hours=float(icrs.ra.to(u.hourangle).value),
+                    dec_degrees=float(icrs.dec.deg))
+        app = observer.at(ts).observe(star).apparent()
+        alt, az, _ = app.altaz()
+        return float(alt.degrees), float(az.degrees)
+
+    # coarse bracket on EAST side
+    best_L, best_abs = 0.0, 1e9
+    for L in range(0, 360, 2):  # 2° steps
+        alt, az = alt_az_of_ecl_lon(L)
+        if 0.0 < az < 180.0:
+            a = abs(alt)
+            if a < best_abs:
+                best_abs, best_L = a, L
+
+    # refine
+    step = 1.0
+    L0 = best_L
+    for _ in range(12):  # ~millidegree precision
+        candidates = [L0 - step, L0, L0 + step]
+        best = (1e9, L0)
+        for L in candidates:
+            alt, az = alt_az_of_ecl_lon(L % 360.0)
+            if 0.0 < az < 180.0:
+                a = abs(alt)
+                if a < best[0]:
+                    best = (a, L % 360.0)
+        L0 = best[1]
+        step *= 0.5
+
+    return L0 % 360.0
+
+
+# --------------------------
+# Main chart computation
+# --------------------------
+def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> Tuple[Dict[str, Any], bool]:
     # 1) Geocode + time
     lat, lon, tz_str = geocode_place(place)
     dt_utc, est = to_utc(date, time_str, tz_str)
@@ -167,23 +238,16 @@ def compute_chart(name: str, date: str, time_str: str | None, place: str) -> Tup
     earth = eph['earth']
     observer = earth + Topos(latitude_degrees=lat, longitude_degrees=lon)
 
-    # 4) Ascendant (MVP) + cosmetic constellation (not used for sign)
-    asc_lon = compute_ascendant(ts, observer, ts.tt, lat, lon)
-    asc_sign = sign_from_ecliptic_lon(asc_lon)
+    # 4) Ascendant (accurate) + sign label from IAU constellation at that ecliptic point
+    asc_lon = compute_ascendant(ts, observer, lat, lon)
+    t_ast = Time(ts.utc_datetime())
+    asc_sc = SkyCoord(lon=asc_lon*u.deg, lat=0*u.deg, frame=GeocentricTrueEcliptic(equinox=t_ast))
+    asc_icrs = asc_sc.icrs
+    asc_const_raw = get_constellation(asc_icrs)          # IAU name
+    asc_sign = constellation_to_13sign(asc_const_raw)    # map to 13-sign label
+    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': asc_sign}
 
-    # Cosmetic (equatorial) constellation label for asc — purely informative:
-    try:
-        dummy = observer.at(ts).observe(eph['sun']).apparent()
-        ra, dec, _ = dummy.radec()
-        sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
-        asc_const = constellation_to_13sign(get_constellation(sc))
-    except Exception:
-        asc_const = ""
-
-    ascendant = {'lon': asc_lon, 'sign': asc_sign, 'constellation': asc_const}
-
-    # 5) Planets (apparent ecliptic longitudes)
-    # Use barycenters for outer planets for stability; Pluto is fine as 'pluto'
+    # 5) Planets (apparent ecliptic longitudes; barycenters where needed)
     keys = {
         'Sun': 'sun',
         'Moon': 'moon',
@@ -203,47 +267,51 @@ def compute_chart(name: str, date: str, time_str: str | None, place: str) -> Tup
         app = observer.at(ts).observe(target).apparent()
         lon_ecl = ecl_lon_from_skyfield(app)
 
-        # Equatorial constellation (mapped/merged) for info
+        # Equatorial constellation (mapped) for sign label
         try:
             ra, dec, _ = app.radec()
             sc = SkyCoord(ra=ra.hours*u.hourangle, dec=dec.degrees*u.deg, frame='icrs')
-            const_raw = get_constellation(sc)
+            const_raw = get_constellation(sc)      # e.g., 'Libra', 'Scorpius', 'Ophiuchus', ...
+            sign13 = constellation_to_13sign(const_raw)
         except Exception:
-            const_raw = ""
+            sign13 = ""
 
         planets.append({
             'body': label,
             'lon': lon_ecl,
-            'sign': sign_from_ecliptic_lon(lon_ecl),
-            'constellation': constellation_to_13sign(const_raw)
+            'sign': sign13,
+            'constellation': sign13
         })
 
-    # 6) Nodes
+    # 6) Nodes (mean)
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = south_node_lon(nn_lon)
+
+    def sign_from_ecl_point(lon_deg: float) -> str:
+        """Sign label for an ecliptic point: transform point -> ICRS -> IAU constellation -> 13-sign."""
+        tpt = SkyCoord(lon=lon_deg*u.deg, lat=0*u.deg, frame=GeocentricTrueEcliptic(equinox=t_ast)).icrs
+        return constellation_to_13sign(get_constellation(tpt))
+
     nodes = {
-        'north_node': {'lon': nn_lon, 'sign': sign_from_ecliptic_lon(nn_lon)},
-        'south_node': {'lon': sn_lon, 'sign': sign_from_ecliptic_lon(sn_lon)}
+        'north_node': {'lon': nn_lon, 'sign': sign_from_ecl_point(nn_lon)},
+        'south_node': {'lon': sn_lon, 'sign': sign_from_ecl_point(sn_lon)}
     }
 
     # 7) Midheaven
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc = {'lon': mc_lon, 'sign': sign_from_ecliptic_lon(mc_lon)}
+    mc = {'lon': mc_lon, 'sign': sign_from_ecl_point(mc_lon)}
 
-    # 8) Chiron
-    try:
-        chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
+    # 8) Chiron (optional)
+    chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
+    if chi_lon is not None:
         planets.append({
             'body': 'Chiron',
             'lon': chi_lon,
-            'sign': sign_from_ecliptic_lon(chi_lon),
-            'constellation': ''  # optional: compute via ICRS→IAU like above if desired
+            'sign': sign_from_ecl_point(chi_lon),
+            'constellation': sign_from_ecl_point(chi_lon)
         })
-    except Exception:
-        # If Horizons fails (network, rate-limit), skip to keep API responsive
-        pass
 
-    # 9) Houses: whole-sign starting from the Asc sign
+    # 9) Houses: whole-sign from the ASC sign
     houses = [{'house': i+1, 'sign': s} for i, s in enumerate(cycle_from(asc_sign, 12))]
 
     # 10) Payload
