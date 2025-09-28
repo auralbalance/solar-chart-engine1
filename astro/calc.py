@@ -100,6 +100,25 @@ def chiron_ecl_lon(dt_utc, lat_deg, lon_deg):
         ecl = sc.transform_to(GeocentricTrueEcliptic(equinox=t))
         return float(ecl.lon.to(u.deg).value % 360.0)
 
+def geocode_place(place_text: str):
+    """
+    Turn a place name into lat/lon and IANA timezone string.
+    Uses OpenStreetMap Nominatim + timezonefinder.
+    """
+    geocoder = Nominatim(user_agent="solar-chart-api", timeout=15)
+    loc = geocoder.geocode(place_text, addressdetails=False, language="en")
+    if not loc:
+        raise ValueError(f"Place '{place_text}' not found.")
+    lat = float(loc.latitude)
+    lon = float(loc.longitude)
+
+    tf = TimezoneFinder()
+    tz = tf.timezone_at(lng=lon, lat=lat)
+    if not tz:
+        raise ValueError("Timezone not found for the given location.")
+    return lat, lon, tz
+
+
 def compute_chart(name, date, time_str, place):
     # --- 1) Geocode + timezone + UTC ---
     lat, lon, tz_str = geocode_place(place)
