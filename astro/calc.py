@@ -1,7 +1,7 @@
 # astro/calc.py
 
 from __future__ import annotations
-import os
+import os, json
 from datetime import datetime, time as dtime
 from typing import Tuple, Dict, Any, Optional, List
 
@@ -46,15 +46,11 @@ def get_ephemeris():
             return eph, load, fname
         except Exception:
             continue
-    # Last resort: raise a clear error
     raise RuntimeError("No ephemeris available (tried de441.bsp, de440.bsp, de421.bsp).")
 
 
 def pick_key(eph, preferred: str, fallback: str) -> str:
-    """
-    Return preferred target key if present in eph, else fallback if present,
-    else raise helpful error.
-    """
+    """Return preferred target key if present; else fallback; else raise."""
     try:
         _ = eph[preferred]
         return preferred
@@ -63,9 +59,7 @@ def pick_key(eph, preferred: str, fallback: str) -> str:
             _ = eph[fallback]
             return fallback
         except Exception:
-            raise KeyError(
-                f"Neither '{preferred}' nor '{fallback}' available in ephemeris."
-            )
+            raise KeyError(f"Neither '{preferred}' nor '{fallback}' available in ephemeris.")
 
 
 # =================
@@ -103,7 +97,7 @@ def to_utc(date_str: str, time_str: Optional[str], tz_str: str) -> Tuple[datetim
 
 
 # ==========================
-# 13-SIGN IAU BAND MAPPING
+# ZODIAC PROFILES (J2000)
 # ==========================
 CONSTELLATION_TO_13 = {
     "Aries": "Aries",
@@ -120,14 +114,22 @@ CONSTELLATION_TO_13 = {
     "Aquarius": "Aquarius",
     "Pisces": "Pisces",
 }
+SIGNS_13 = [
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpius", "Ophiuchus", "Sagittarius",
+    "Capricornus", "Aquarius", "Pisces",
+]
 
 def constellation_to_13sign(iau_name: str) -> str:
     return CONSTELLATION_TO_13.get(iau_name, iau_name)
 
+# In-memory band store
 _ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # [(start_lon, end_lon, label13)]
+_BUILT_FOR_PROFILE: Optional[str] = None
+_BANDS_VERSION = 1  # bump to force rebuild
 
 
-def _build_ecliptic_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
+def _build_iau_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str]]:
     """
     Build bands by sampling β=0° around the ecliptic at J2000 and detecting constellation changes.
     Output bands cover [0,360). Frame: ecliptic J2000.
@@ -167,23 +169,63 @@ def _build_ecliptic_bands(step_deg: float = 0.2) -> List[Tuple[float, float, str
     return bands
 
 
-def _ensure_bands_built():
-    global _ECLIPTIC_BANDS
-    if not _ECLIPTIC_BANDS:
-        _ECLIPTIC_BANDS = _build_ecliptic_bands(step_deg=0.2)
+def _load_custom_bands() -> List[Tuple[float, float, str]]:
+    """
+    Load custom bands from env CUSTOM_BANDS (JSON string) or file astro/custom_bands.json.
+    Format:
+    [
+      {"name":"Aries","start":0.0,"end":24.0},
+      ...
+      {"name":"Pisces","start":353.0,"end":360.0}
+    ]
+    """
+    raw = os.getenv("CUSTOM_BANDS")
+    data = None
+    if raw:
+        data = json.loads(raw)
+    else:
+        path = os.path.join(os.path.dirname(__file__), "custom_bands.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    if not data:
+        raise RuntimeError("CUSTOM_13 profile selected but no custom bands provided.")
+    bands: List[Tuple[float, float, str]] = []
+    for item in data:
+        name = item["name"]
+        s = float(item["start"])
+        e = float(item["end"])
+        bands.append((s, e, name))
+    # sort and return
+    bands.sort(key=lambda x: x[0])
+    return bands
 
 
-def sign_from_ecliptic_lon(lon_deg: float) -> str:
-    _ensure_bands_built()
+def _ensure_bands(profile: str):
+    global _ECLIPTIC_BANDS, _BUILT_FOR_PROFILE
+    if (_BUILT_FOR_PROFILE != profile) or (not _ECLIPTIC_BANDS):
+        if profile == "IAU_13":
+            _ECLIPTIC_BANDS = _build_iau_bands(step_deg=0.2)
+        elif profile == "CUSTOM_13":
+            _ECLIPTIC_BANDS = _load_custom_bands()
+        else:
+            raise ValueError(f"Unknown ZODIAC_PROFILE '{profile}'")
+        _BUILT_FOR_PROFILE = profile
+
+
+def sign_from_ecliptic_lon(lon_deg: float, profile: str) -> str:
+    _ensure_bands(profile)
     x = lon_deg % 360.0
     for s, e, lab in _ECLIPTIC_BANDS:
-        if s < 0:
-            if (0 <= x < e) or (x + 360.0 >= s and x + 360.0 < e):
-                return lab
-        else:
+        if s <= e:
             if s <= x < e:
                 return lab
-    return "Pisces"  # should not happen
+        else:
+            # wrap band e.g., start=350, end=10
+            if x >= s or x < e:
+                return lab
+    # fallback
+    return "Pisces"
 
 
 # ==========================
@@ -271,16 +313,50 @@ def compute_ascendant(ts, observer) -> float:
             alt, az = alt_az_of_ecl_lon_j2000(L % 360.0)
             if 0.0 < az < 180.0:
                 a = abs(alt)
-                if a < best[0]:
+                if a < best[0]):
                     best = (a, L % 360.0)
         L0 = best[1]; step *= 0.5
     return L0 % 360.0
 
 
 # ===============
+# HOUSES (TOGGLE)
+# ===============
+def build_houses(asc_sign: str, mode: str) -> List[Dict[str, Any]]:
+    """
+    Whole-sign logic, aligned to 13-sign belt.
+    mode="12": 12 houses on 13-sign belt (ASC sign = House 1, then next 11 signs)
+    mode="13": 13 houses on 13-sign belt (ASC sign = House 1, then full cycle)
+    """
+    if mode not in ("12", "13"):
+        mode = "12"
+    start_idx = SIGNS_13.index(asc_sign)
+    count = 13 if mode == "13" else 12
+    return [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(count)]
+
+
+# ===============
 # MAIN CHART
 # ===============
-def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> Tuple[Dict[str, Any], bool]:
+def compute_chart(
+    name: str,
+    date: str,
+    time_str: Optional[str],
+    place: str,
+    house_mode: Optional[str] = None,
+    zodiac_profile: Optional[str] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    house_mode: "12" or "13". If None, env HOUSE_MODE; default "12".
+    zodiac_profile: "IAU_13" or "CUSTOM_13". If None, env ZODIAC_PROFILE; default "IAU_13".
+    """
+    mode = (house_mode or os.getenv("HOUSE_MODE") or "12").strip().lower()
+    mode = "13" if mode in ("13", "h13", "thirteen") else "12"
+
+    profile = (zodiac_profile or os.getenv("ZODIAC_PROFILE") or "IAU_13").strip().upper()
+    if profile not in ("IAU_13", "CUSTOM_13"):
+        profile = "IAU_13"
+
     # 1) Geo + time
     lat, lon, tz_str = geocode_place(place)
     dt_utc, time_estimated = to_utc(date, time_str, tz_str)
@@ -293,7 +369,7 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
 
     # 3) Resolve targets with fallbacks for this ephemeris
     targets = {
-        "Sun": pick_key(eph, "sun", "10"),  # 10 is SUN id in many kernels
+        "Sun": pick_key(eph, "sun", "10"),
         "Moon": pick_key(eph, "moon", "301"),
         "Mercury": pick_key(eph, "mercury", "199"),
         "Venus": pick_key(eph, "venus", "299"),
@@ -302,13 +378,12 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
         "Saturn": pick_key(eph, "saturn", "saturn barycenter"),
         "Uranus": pick_key(eph, "uranus", "uranus barycenter"),
         "Neptune": pick_key(eph, "neptune", "neptune barycenter"),
-        # Prefer Pluto center if present; else barycenter
         "Pluto": pick_key(eph, "pluto", "pluto barycenter"),
     }
 
     # 4) Ascendant
     asc_lon = compute_ascendant(ts, observer)
-    asc_sign = sign_from_ecliptic_lon(asc_lon)
+    asc_sign = sign_from_ecliptic_lon(asc_lon, profile)
     ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign}
 
     # 5) Planets → ecliptic J2000
@@ -316,20 +391,20 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
-        sign13 = sign_from_ecliptic_lon(L)
+        sign13 = sign_from_ecliptic_lon(L, profile)
         planets.append({"body": label, "lon": L, "sign": sign13, "constellation": sign13})
 
     # 6) Nodes (mean)
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
     nodes = {
-        "north_node": {"lon": nn_lon, "sign": sign_from_ecliptic_lon(nn_lon)},
-        "south_node": {"lon": sn_lon, "sign": sign_from_ecliptic_lon(sn_lon)},
+        "north_node": {"lon": nn_lon, "sign": sign_from_ecliptic_lon(nn_lon, profile)},
+        "south_node": {"lon": sn_lon, "sign": sign_from_ecliptic_lon(sn_lon, profile)},
     }
 
     # 7) Midheaven
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc = {"lon": mc_lon, "sign": sign_from_ecliptic_lon(mc_lon)}
+    mc = {"lon": mc_lon, "sign": sign_from_ecliptic_lon(mc_lon, profile)}
 
     # 8) Chiron (optional)
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
@@ -338,19 +413,13 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
             {
                 "body": "Chiron",
                 "lon": chi_lon,
-                "sign": sign_from_ecliptic_lon(chi_lon),
-                "constellation": sign_from_ecliptic_lon(chi_lon),
+                "sign": sign_from_ecliptic_lon(chi_lon, profile),
+                "constellation": sign_from_ecliptic_lon(chi_lon, profile),
             }
         )
 
-    # 9) Houses: whole-sign from ASC, 12 houses on 13-sign belt (explicit by design)
-    SIGNS_13 = [
-        "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
-        "Libra", "Scorpius", "Ophiuchus", "Sagittarius",
-        "Capricornus", "Aquarius", "Pisces",
-    ]
-    start_idx = SIGNS_13.index(asc_sign)
-    houses = [{"house": i + 1, "sign": SIGNS_13[(start_idx + i) % 13]} for i in range(12)]
+    # 9) Houses (toggle)
+    houses = build_houses(asc_sign, mode)
 
     payload = {
         "name": name,
@@ -363,7 +432,9 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
         "houses": houses,
         "frames": {"ecliptic_bands": "J2000", "positions": "J2000"},
         "ephemeris": eph_name,
-        "house_model": "Whole-sign start from ASC, 12 houses on 13-sign belt",
+        "house_model": f"Whole-sign; {len(houses)} houses on 13-sign belt",
+        "house_mode": mode,
+        "zodiac_profile": profile,
         "time_estimated": time_estimated,
     }
     return payload, time_estimated
