@@ -8,3 +8,5 @@ timezonefinder==5.2.0
 pytz==2024.1
 svgwrite==1.4.3
 python-multipart==0.0.9
+astroquery==0.4.7
+
