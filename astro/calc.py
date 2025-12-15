@@ -122,6 +122,25 @@ SIGNS_13 = [
     "Libra","Scorpius","Ophiuchus","Sagittarius",
     "Capricornus","Aquarius","Pisces",
 ]
+
+# 12-SIGN SIDEREAL (30° equal divisions, no Ophiuchus)
+SIGNS_12_SIDEREAL = [
+    "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+    "Libra","Scorpius","Sagittarius","Capricornus","Aquarius","Pisces",
+]
+
+def sign_12_sidereal(lon_deg: float) -> str:
+    """
+    12-sign sidereal: equal 30° divisions.
+    0-30° = Aries, 30-60° = Taurus, etc.
+    Uses Lahiri ayanamsa approximation (~24° for 2000).
+    """
+    # Lahiri ayanamsa for J2000.0 ≈ 23.85°
+    ayanamsa = 23.85
+    sidereal_lon = (lon_deg - ayanamsa) % 360.0
+    index = int(sidereal_lon / 30.0) % 12
+    return SIGNS_12_SIDEREAL[index]
+
 CONSTELLATION_TO_13 = {
     "Aries": "Aries",
     "Taurus": "Taurus",
@@ -341,8 +360,9 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
 
     # 3) Ascendant
     asc_lon = compute_ascendant(ts, observer)
-    asc_sign = sign_from_ecliptic_lon(asc_lon)
-    ascendant = {"lon": asc_lon, "sign": asc_sign, "constellation": asc_sign, "house": 1}
+    asc_sign_12 = sign_12_sidereal(asc_lon)  # 12-sign sidereal
+    asc_sign_13 = sign_from_ecliptic_lon(asc_lon)  # 13-sign constellation
+    ascendant = {"lon": asc_lon, "sign": asc_sign_12, "constellation": asc_sign_13, "house": 1}
 
     # 4) Planets — classify by ecliptic longitude bands
     targets = {
@@ -362,44 +382,49 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
-        sign13 = sign_from_ecliptic_lon(L)
+        sign_12 = sign_12_sidereal(L)  # 12-sign sidereal (30° divisions)
+        sign_13 = sign_from_ecliptic_lon(L)  # 13-sign constellation (IAU boundaries)
         planets.append({
             "body": label,
             "lon": L,
-            "sign": sign13,
-            "constellation": sign13,
-            "house": house_number_for_sign_13(sign13, asc_sign),
+            "sign": sign_12,  # 12-sign sidereal
+            "constellation": sign_13,  # 13-sign constellation
+            "house": house_number_for_sign_13(sign_13, asc_sign_13),
         })
 
-    # 5) Nodes — mean; classify by ecliptic bands
+    # 5) Nodes — mean; classify by both systems
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
-    nn_sign = sign_from_ecliptic_lon(nn_lon)
-    sn_sign = sign_from_ecliptic_lon(sn_lon)
+    nn_sign_12 = sign_12_sidereal(nn_lon)
+    nn_sign_13 = sign_from_ecliptic_lon(nn_lon)
+    sn_sign_12 = sign_12_sidereal(sn_lon)
+    sn_sign_13 = sign_from_ecliptic_lon(sn_lon)
     nodes = {
-        "north_node": {"lon": nn_lon, "sign": nn_sign, "house": house_number_for_sign_13(nn_sign, asc_sign)},
-        "south_node": {"lon": sn_lon, "sign": sn_sign, "house": house_number_for_sign_13(sn_sign, asc_sign)},
+        "north_node": {"lon": nn_lon, "sign": nn_sign_12, "constellation": nn_sign_13, "house": house_number_for_sign_13(nn_sign_13, asc_sign_13)},
+        "south_node": {"lon": sn_lon, "sign": sn_sign_12, "constellation": sn_sign_13, "house": house_number_for_sign_13(sn_sign_13, asc_sign_13)},
     }
 
-    # 6) Midheaven — classify by ecliptic bands
+    # 6) Midheaven — classify by both systems
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc_sign = sign_from_ecliptic_lon(mc_lon)
-    mc = {"lon": mc_lon, "sign": mc_sign, "house": house_number_for_sign_13(mc_sign, asc_sign)}
+    mc_sign_12 = sign_12_sidereal(mc_lon)
+    mc_sign_13 = sign_from_ecliptic_lon(mc_lon)
+    mc = {"lon": mc_lon, "sign": mc_sign_12, "constellation": mc_sign_13, "house": house_number_for_sign_13(mc_sign_13, asc_sign_13)}
 
-    # 7) Chiron (Horizons) — classify by ecliptic bands
+    # 7) Chiron (Horizons) — classify by both systems
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
-        chi_sign = sign_from_ecliptic_lon(chi_lon)
+        chi_sign_12 = sign_12_sidereal(chi_lon)
+        chi_sign_13 = sign_from_ecliptic_lon(chi_lon)
         planets.append({
             "body": "Chiron",
             "lon": chi_lon,
-            "sign": chi_sign,
-            "constellation": chi_sign,
-            "house": house_number_for_sign_13(chi_sign, asc_sign),
+            "sign": chi_sign_12,  # 12-sign sidereal
+            "constellation": chi_sign_13,  # 13-sign constellation
+            "house": house_number_for_sign_13(chi_sign_13, asc_sign_13),
         })
 
     # 8) Houses
-    houses = build_houses_13(asc_sign)
+    houses = build_houses_13(asc_sign_13)
 
     payload = {
         "name": name,
