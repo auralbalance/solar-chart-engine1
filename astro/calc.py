@@ -123,23 +123,11 @@ SIGNS_13 = [
     "Capricornus","Aquarius","Pisces",
 ]
 
-# 12-SIGN SIDEREAL (30° equal divisions, no Ophiuchus)
-SIGNS_12_SIDEREAL = [
+# 12-SIGN TRADITIONAL (no Ophiuchus, equal 30° divisions)
+SIGNS_12 = [
     "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
-    "Libra","Scorpius","Sagittarius","Capricornus","Aquarius","Pisces",
+    "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces",
 ]
-
-def sign_12_sidereal(lon_deg: float) -> str:
-    """
-    12-sign sidereal: equal 30° divisions.
-    0-30° = Aries, 30-60° = Taurus, etc.
-    Uses Lahiri ayanamsa approximation (~24° for 2000).
-    """
-    # Lahiri ayanamsa for J2000.0 ≈ 23.85°
-    ayanamsa = 23.85
-    sidereal_lon = (lon_deg - ayanamsa) % 360.0
-    index = int(sidereal_lon / 30.0) % 12
-    return SIGNS_12_SIDEREAL[index]
 
 CONSTELLATION_TO_13 = {
     "Aries": "Aries",
@@ -172,49 +160,53 @@ def canon_sign(name: str) -> str:
 
 
 # ==========================
-# IAU ECLIPTIC BANDS (β=0°)
+# 13-SIGN CONSTELLATION BANDS (from custom_bands.json)
 # ==========================
 _ECLIPTIC_BANDS: List[Tuple[float, float, str]] = []  # (start, end, sign)
 
-def _build_ecliptic_bands(step_deg: float = 0.05) -> List[Tuple[float, float, str]]:
-    bands: List[Tuple[float, float, str]] = []
-    t = Time("J2000")
-    current_label: Optional[str] = None
-    seg_start = 0.0
-    n = int(360.0 / step_deg)
-
-    for i in range(n + 1):
-        L = (i * step_deg) % 360.0
-        sc = SkyCoord(lon=L * u.deg, lat=0.0 * u.deg,
-                      frame=GeocentricTrueEcliptic(equinox=t)).icrs
-        iau = get_constellation(sc)
-        label = CONSTELLATION_TO_13.get(iau)
-        if label is None:
-            label = current_label if current_label is not None else "Pisces"
-        if current_label is None:
-            current_label = label
-            seg_start = L
-        elif label != current_label:
-            bands.append((seg_start, L, current_label))
-            seg_start = L
-            current_label = label
-
-    if current_label is not None:
-        bands.append((seg_start, 360.0, current_label))
-
-    if bands and bands[0][2] == bands[-1][2]:
-        first_s, first_e, lab = bands[0]
-        last_s, last_e, _ = bands[-1]
-        bands = [(last_s - 360.0, first_e, lab)] + bands[1:-1]
-
-    bands.sort(key=lambda x: x[0])
-    return bands
+def _load_custom_bands() -> List[Tuple[float, float, str]]:
+    """Load constellation boundaries from custom_bands.json"""
+    import json
+    bands_path = os.path.join(os.path.dirname(__file__), "custom_bands.json")
+    
+    # Try multiple possible locations
+    possible_paths = [
+        bands_path,
+        "custom_bands.json",
+        "./custom_bands.json",
+        "../custom_bands.json",
+        "/app/custom_bands.json",
+        "/app/astro/custom_bands.json"
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                bands_json = json.load(f)
+            return [(b["start"], b["end"], b["name"]) for b in bands_json]
+    
+    # Fallback to hardcoded values if file not found
+    return [
+        (0.0, 30.0, "Aries"),
+        (30.0, 72.0, "Taurus"),
+        (72.0, 90.0, "Gemini"),
+        (90.0, 138.0, "Cancer"),
+        (138.0, 168.0, "Leo"),
+        (168.0, 204.0, "Virgo"),
+        (204.0, 241.0, "Libra"),
+        (241.0, 247.0, "Scorpius"),
+        (247.0, 266.0, "Ophiuchus"),
+        (266.0, 296.0, "Sagittarius"),
+        (296.0, 326.0, "Capricornus"),
+        (326.0, 353.0, "Aquarius"),
+        (353.0, 360.0, "Pisces")
+    ]
 
 
 def _ensure_bands():
     global _ECLIPTIC_BANDS
     if not _ECLIPTIC_BANDS:
-        _ECLIPTIC_BANDS = _build_ecliptic_bands(step_deg=0.05)
+        _ECLIPTIC_BANDS = _load_custom_bands()
 
 
 def get_ecliptic_bands() -> List[Dict[str, Any]]:
@@ -237,6 +229,28 @@ def sign_from_ecliptic_lon(lon_deg: float) -> str:
             if x >= s or x < e:
                 return lab
     return "Pisces"
+
+
+def sign_12_sidereal(lon_deg: float, dt_utc: datetime) -> str:
+    """
+    Calculate 12-sign sidereal position (traditional, no Ophiuchus).
+    Uses Lahiri ayanamsa to convert tropical longitude to sidereal.
+    Then divides into 12 equal 30° signs.
+    """
+    # Lahiri ayanamsa for the given date
+    t = Time(dt_utc)
+    days_since_j2000 = t.jd - 2451545.0
+    years_since_j2000 = days_since_j2000 / 365.25
+    
+    # Lahiri ayanamsa: ~23.85° at J2000, increases ~50.3" per year
+    ayanamsa = 23.85 + (years_since_j2000 * 50.3 / 3600.0)
+    
+    # Convert tropical to sidereal
+    sidereal_lon = (lon_deg - ayanamsa) % 360.0
+    
+    # Divide into 12 equal signs
+    sign_index = int(sidereal_lon / 30.0) % 12
+    return SIGNS_12[sign_index]
 
 
 # ==========================
@@ -360,9 +374,9 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
 
     # 3) Ascendant
     asc_lon = compute_ascendant(ts, observer)
-    asc_sign_12 = sign_12_sidereal(asc_lon)  # 12-sign sidereal
-    asc_sign_13 = sign_from_ecliptic_lon(asc_lon)  # 13-sign constellation
-    ascendant = {"lon": asc_lon, "sign": asc_sign_12, "constellation": asc_sign_13, "house": 1}
+    asc_sign13 = sign_from_ecliptic_lon(asc_lon)  # 13-sign IAU
+    asc_sign12 = sign_12_sidereal(asc_lon, dt_utc)  # 12-sign sidereal
+    ascendant = {"lon": asc_lon, "sign": asc_sign12, "constellation": asc_sign13, "house": 1}
 
     # 4) Planets — classify by ecliptic longitude bands
     targets = {
@@ -382,49 +396,49 @@ def compute_chart(name: str, date: str, time_str: Optional[str], place: str) -> 
     for label, key in targets.items():
         app = observer.at(ts).observe(eph[key]).apparent()
         L = ecl_lon_from_app(app)
-        sign_12 = sign_12_sidereal(L)  # 12-sign sidereal (30° divisions)
-        sign_13 = sign_from_ecliptic_lon(L)  # 13-sign constellation (IAU boundaries)
+        sign13 = sign_from_ecliptic_lon(L)  # 13-sign IAU constellation
+        sign12 = sign_12_sidereal(L, dt_utc)  # 12-sign traditional sidereal
         planets.append({
             "body": label,
             "lon": L,
-            "sign": sign_12,  # 12-sign sidereal
-            "constellation": sign_13,  # 13-sign constellation
-            "house": house_number_for_sign_13(sign_13, asc_sign_13),
+            "sign": sign12,  # 12-sign sidereal (no Ophiuchus)
+            "constellation": sign13,  # 13-sign IAU (with Ophiuchus)
+            "house": house_number_for_sign_13(sign13, asc_sign13),
         })
 
-    # 5) Nodes — mean; classify by both systems
+    # 5) Nodes — mean; classify by ecliptic bands
     nn_lon = mean_lunar_node_lon(dt_utc)
     sn_lon = (nn_lon + 180.0) % 360.0
-    nn_sign_12 = sign_12_sidereal(nn_lon)
-    nn_sign_13 = sign_from_ecliptic_lon(nn_lon)
-    sn_sign_12 = sign_12_sidereal(sn_lon)
-    sn_sign_13 = sign_from_ecliptic_lon(sn_lon)
+    nn_sign13 = sign_from_ecliptic_lon(nn_lon)  # 13-sign IAU
+    nn_sign12 = sign_12_sidereal(nn_lon, dt_utc)  # 12-sign sidereal
+    sn_sign13 = sign_from_ecliptic_lon(sn_lon)  # 13-sign IAU
+    sn_sign12 = sign_12_sidereal(sn_lon, dt_utc)  # 12-sign sidereal
     nodes = {
-        "north_node": {"lon": nn_lon, "sign": nn_sign_12, "constellation": nn_sign_13, "house": house_number_for_sign_13(nn_sign_13, asc_sign_13)},
-        "south_node": {"lon": sn_lon, "sign": sn_sign_12, "constellation": sn_sign_13, "house": house_number_for_sign_13(sn_sign_13, asc_sign_13)},
+        "north_node": {"lon": nn_lon, "sign": nn_sign12, "constellation": nn_sign13, "house": house_number_for_sign_13(nn_sign13, asc_sign13)},
+        "south_node": {"lon": sn_lon, "sign": sn_sign12, "constellation": sn_sign13, "house": house_number_for_sign_13(sn_sign13, asc_sign13)},
     }
 
-    # 6) Midheaven — classify by both systems
+    # 6) Midheaven — classify by ecliptic bands
     mc_lon = midheaven_lon(dt_utc, lon)
-    mc_sign_12 = sign_12_sidereal(mc_lon)
-    mc_sign_13 = sign_from_ecliptic_lon(mc_lon)
-    mc = {"lon": mc_lon, "sign": mc_sign_12, "constellation": mc_sign_13, "house": house_number_for_sign_13(mc_sign_13, asc_sign_13)}
+    mc_sign13 = sign_from_ecliptic_lon(mc_lon)  # 13-sign IAU
+    mc_sign12 = sign_12_sidereal(mc_lon, dt_utc)  # 12-sign sidereal
+    mc = {"lon": mc_lon, "sign": mc_sign12, "constellation": mc_sign13, "house": house_number_for_sign_13(mc_sign13, asc_sign13)}
 
-    # 7) Chiron (Horizons) — classify by both systems
+    # 7) Chiron (Horizons) — classify by ecliptic bands
     chi_lon = chiron_ecl_lon(dt_utc, lat, lon)
     if chi_lon is not None:
-        chi_sign_12 = sign_12_sidereal(chi_lon)
-        chi_sign_13 = sign_from_ecliptic_lon(chi_lon)
+        chi_sign13 = sign_from_ecliptic_lon(chi_lon)  # 13-sign IAU
+        chi_sign12 = sign_12_sidereal(chi_lon, dt_utc)  # 12-sign sidereal
         planets.append({
             "body": "Chiron",
             "lon": chi_lon,
-            "sign": chi_sign_12,  # 12-sign sidereal
-            "constellation": chi_sign_13,  # 13-sign constellation
-            "house": house_number_for_sign_13(chi_sign_13, asc_sign_13),
+            "sign": chi_sign12,  # 12-sign sidereal (no Ophiuchus)
+            "constellation": chi_sign13,  # 13-sign IAU (with Ophiuchus)
+            "house": house_number_for_sign_13(chi_sign13, asc_sign13),
         })
 
     # 8) Houses
-    houses = build_houses_13(asc_sign_13)
+    houses = build_houses_13(asc_sign13)
 
     payload = {
         "name": name,
